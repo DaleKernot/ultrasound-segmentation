@@ -135,23 +135,37 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
             Text_data.append(None)
             Fail = 0
 
-        try:  # Try initial segmentation
-            segmentation_mask, Xmin, Xmax, Ymin, Ymax = general_functions.initial_segmentation(
-                input_image_obj=PIL_col
-            )
-        except Exception:  # flat fail on 1
-            logger.error("Failed Initial segmentation")
-            Fail = Fail + 1
-            pass
+        if us_image:
+            try:  # Try initial segmentation
+                segmentation_mask, Xmin, Xmax, Ymin, Ymax = general_functions.initial_segmentation(
+                    input_image_obj=PIL_col
+                )
+            except Exception:  # flat fail on 1
+                logger.error("Failed Initial segmentation")
+                Fail = Fail + 1
+                pass
 
-        try:  # define end ROIs
-            Left_dimensions, Right_dimensions = general_functions.define_end_rois(
-                segmentation_mask, Xmin, Xmax, Ymin, Ymax
-            )
-        except Exception:
-            logger.error("Failed Defining ROI")
-            Fail = Fail + 1
-            pass
+            try:  # define end ROIs
+                Left_dimensions, Right_dimensions = general_functions.define_end_rois(
+                    segmentation_mask, Xmin, Xmax, Ymin, Ymax
+                )
+            except Exception:
+                logger.error("Failed Defining ROI")
+                Fail = Fail + 1
+                pass
+        elif us_dicom:
+            # DICOM: extract bounding box coordinates from metadata
+            segmentation_mask = None
+            Xmin = dicom_metadata.get("RegionLocationMinX0")
+            Xmax = dicom_metadata.get("RegionLocationMaxX1")
+            Ymin = dicom_metadata.get("RegionLocationMinY0")
+            Ymax = dicom_metadata.get("RegionLocationMaxY1")
+            Left_dimensions = Right_dimensions = None
+        else:
+            # Unknown file type: skip segmentation and ROI definition
+            segmentation_mask = None
+            Xmin = Xmax = Ymin = Ymax = None
+            Left_dimensions = Right_dimensions = None
 
         try:
             Waveform_dimensions = [Xmin, Xmax, Ymin, Ymax]
