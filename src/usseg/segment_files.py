@@ -87,6 +87,8 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
     Text_data = []  # text data extracted from image
     Annotated_scans = []
     Digitized_scans = []
+    # Paths for HTML column 1 (plain scan): same as input for images; for DICOM, a saved PNG (browser can't show .dcm)
+    scan_display_paths = []
 
     for input_image_filename in filenames:  # Iterate through all file names and populate excel file
         # input_image_filename = "E:/us-data-anon/0000/IHE_PDI/00003511/AA3A43F2/AAD8766D/0000371E\\EEEAE224.JPG"
@@ -99,14 +101,18 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
         # is_image: jpeg, png, or other common image formats
         us_image = ext in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp")
 
+        # Path to show in HTML column 1 (plain scan). For DICOM we save a PNG so the browser can display it.
+        scan_display_path = input_image_filename
         if us_dicom:
-            # DICOM files skip text extraction, but extract metadata
+            # DICOM files skip text extraction, but extract metadata. Do not append to Text_data here;
+            # we append the metrics DataFrame (or None on exception) later, once per file, like images.
             logger.info(f"Processing DICOM file: {input_image_filename}")
             dicom_metadata = general_functions.extract_dicom_metadata(input_image_filename)
             PIL_image, cv2_img = general_functions.extract_doppler_from_dicom(input_image_filename)
-            #general_functions.debug_plot_doppler_overlay(PIL_image, dicom_metadata, ref_is_relative=True)
-
-            Text_data.append(None)
+            # Save Doppler as PNG for HTML column 1 (raw .dcm bytes are not displayable as image in browser)
+            source_path = output_dir + image_name.partition(".")[0] + "_Source.png"
+            PIL_image.save(source_path)
+            scan_display_path = source_path
             Fail = 0
         elif us_image:
             try:  # Try text extraction
@@ -364,8 +370,10 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                 ax1.tick_params(axis="both", which="both", length=0)
                 fig1.savefig(Annotated_path, dpi=900, bbox_inches="tight", pad_inches=0)
                 Annotated_scans.append(Annotated_path)
+                scan_display_paths.append(scan_display_path)
             else:
                 Annotated_scans.append(None)
+                scan_display_paths.append(scan_display_path)
 
             # Metrics/correction: images use plot_correction (text df + digitized); DICOM uses waveform metrics only.
             if us_image:
@@ -390,6 +398,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
         except Exception:
             logger.error("Failed Digitization")
             Annotated_scans.append(None)
+            scan_display_paths.append(scan_display_path)
             traceback.print_exc()
             try:
                 Text_data.append(df)
@@ -431,7 +440,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
         if pickle_path is None:
             pickle_path = toml.load("config.toml")["pickle"]["segmented_data"]
         with open(pickle_path, "wb") as f:
-            pickle.dump([filenames, Digitized_scans, Annotated_scans, Text_data], f)
+            pickle.dump([scan_display_paths, Digitized_scans, Annotated_scans, Text_data], f)
     i = 0
     return filenames, Digitized_scans, Annotated_scans, Text_data
 

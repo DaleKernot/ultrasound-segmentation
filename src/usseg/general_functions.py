@@ -2004,6 +2004,7 @@ def plot_digitized_data_dicom(dicom_metadata, top_curve_coords=None):
     Xplot = x_ref_phys + (col_pixels - x_ref) * dx
     Yplot = y_ref_phys + (row_pixels - y_ref) * dy
 
+    plt.figure(2)
     plt.plot(Xplot, Yplot, "-")
     plt.xlabel("Physical X (time or distance)")
     plt.ylabel("Physical Y (e.g. velocity)")
