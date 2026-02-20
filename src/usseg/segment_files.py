@@ -103,8 +103,8 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
             # DICOM files skip text extraction, but extract metadata
             logger.info(f"Processing DICOM file: {input_image_filename}")
             dicom_metadata = general_functions.extract_dicom_metadata(input_image_filename)
-            PIL_image, cv2_image = general_functions.extract_doppler_from_dicom(input_image_filename)
-            general_functions.debug_plot_doppler_overlay(PIL_image, dicom_metadata, ref_is_relative=True)
+            PIL_image, cv2_img = general_functions.extract_doppler_from_dicom(input_image_filename)
+            #general_functions.debug_plot_doppler_overlay(PIL_image, dicom_metadata, ref_is_relative=True)
 
             Text_data.append(None)
             Fail = 0
@@ -184,121 +184,125 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
         ROIR = None
         y_zero = None
 
-        try:  # Search for ticks and labels - Left axis
-            (
-                Cs,
-                ROIAX,
-                CenPoints,
-                onY,
-                BCs,
-                TYLshift,
-                thresholded_image,
-                Side,
-                Left_dimensions,
-                Right_dimensions,
-                ROI2,
-                ROI3,
-            ) = general_functions.search_for_ticks(
-                cv2_img, "Left", Left_dimensions, Right_dimensions
-            )
-            ROIAX, Lnumber, Lpositions, ROIL = general_functions.search_for_labels(
-                Cs,
-                ROIAX,
-                CenPoints,
-                onY,
-                BCs,
-                TYLshift,
-                Side,
-                Left_dimensions,
-                Right_dimensions,
-                cv2_img,
-                ROI2,
-                ROI3,
-            )
-            # Validate and lightly clean left-axis ticks/labels
-            Lnumber, Lpositions = general_functions.validate_axis_ticks(
-                Lnumber, Lpositions, side="Left"
-            )
-        except Exception:
-            traceback.print_exc()  # prints the error message and traceback
-            logger.error("Failed Left Axes search")
+        if us_image:
+            try:  # Search for ticks and labels - Left axis
+                (
+                    Cs,
+                    ROIAX,
+                    CenPoints,
+                    onY,
+                    BCs,
+                    TYLshift,
+                    thresholded_image,
+                    Side,
+                    Left_dimensions,
+                    Right_dimensions,
+                    ROI2,
+                    ROI3,
+                ) = general_functions.search_for_ticks(
+                    cv2_img, "Left", Left_dimensions, Right_dimensions
+                )
+                ROIAX, Lnumber, Lpositions, ROIL = general_functions.search_for_labels(
+                    Cs,
+                    ROIAX,
+                    CenPoints,
+                    onY,
+                    BCs,
+                    TYLshift,
+                    Side,
+                    Left_dimensions,
+                    Right_dimensions,
+                    cv2_img,
+                    ROI2,
+                    ROI3,
+                )
+                # Validate and lightly clean left-axis ticks/labels
+                Lnumber, Lpositions = general_functions.validate_axis_ticks(
+                    Lnumber, Lpositions, side="Left"
+                )
+            except Exception:
+                traceback.print_exc()  # prints the error message and traceback
+                logger.error("Failed Left Axes search")
 
-            Fail = Fail + 1
-            pass
+                Fail = Fail + 1
+                pass
 
-        try:  # Search for ticks and labels - Right axis
-            (
-                Cs,
-                ROIAX,
-                CenPoints,
-                onY,
-                BCs,
-                TYLshift,
-                thresholded_image,
-                Side,
-                Left_dimensions,
-                Right_dimensions,
-                ROI2,
-                ROI3,
-            ) = general_functions.search_for_ticks(
-                cv2_img, "Right", Left_dimensions, Right_dimensions
-            )
-            ROIAX, Rnumber, Rpositions, ROIR = general_functions.search_for_labels(
-                Cs,
-                ROIAX,
-                CenPoints,
-                onY,
-                BCs,
-                TYLshift,
-                Side,
-                Left_dimensions,
-                Right_dimensions,
-                cv2_img,
-                ROI2,
-                ROI3,
-            )
-            # Validate and lightly clean right-axis ticks/labels
-            Rnumber, Rpositions = general_functions.validate_axis_ticks(
-                Rnumber, Rpositions, side="Right"
-            )
-        except Exception:
-            traceback.print_exc()  # prints the error message and traceback
-            logger.error("Failed Right Axes search")
+            try:  # Search for ticks and labels - Right axis
+                (
+                    Cs,
+                    ROIAX,
+                    CenPoints,
+                    onY,
+                    BCs,
+                    TYLshift,
+                    thresholded_image,
+                    Side,
+                    Left_dimensions,
+                    Right_dimensions,
+                    ROI2,
+                    ROI3,
+                ) = general_functions.search_for_ticks(
+                    cv2_img, "Right", Left_dimensions, Right_dimensions
+                )
+                ROIAX, Rnumber, Rpositions, ROIR = general_functions.search_for_labels(
+                    Cs,
+                    ROIAX,
+                    CenPoints,
+                    onY,
+                    BCs,
+                    TYLshift,
+                    Side,
+                    Left_dimensions,
+                    Right_dimensions,
+                    cv2_img,
+                    ROI2,
+                    ROI3,
+                )
+                # Validate and lightly clean right-axis ticks/labels
+                Rnumber, Rpositions = general_functions.validate_axis_ticks(
+                    Rnumber, Rpositions, side="Right"
+                )
+            except Exception:
+                traceback.print_exc()  # prints the error message and traceback
+                logger.error("Failed Right Axes search")
 
-            Fail = Fail + 1
-            pass
+                Fail = Fail + 1
+                pass
 
-        # Cross-check consistency between left and right axes where both exist
-        try:
-            axis_agree = None
+            # Cross-check consistency between left and right axes where both exist
+            try:
+                axis_agree = None
 
-            # Only attempt a strict left/right consistency check if both sides
-            # actually produced ticks and positions.
-            if (
-                Lnumber is not None
-                and Lpositions is not None
-                and Rnumber is not None
-                and Rpositions is not None
-            ):
-                axis_agree = general_functions.validate_axis_pair(
-                    Lnumber, Lpositions, Rnumber, Rpositions
+                # Only attempt a strict left/right consistency check if both sides
+                # actually produced ticks and positions.
+                if (
+                    Lnumber is not None
+                    and Lpositions is not None
+                    and Rnumber is not None
+                    and Rpositions is not None
+                ):
+                    axis_agree = general_functions.validate_axis_pair(
+                        Lnumber, Lpositions, Rnumber, Rpositions
+                    )
+
+                # Estimate a global y=0 line (in image coordinates), using whatever
+                # sides are available. The helper handles None gracefully.
+                y_zero = general_functions.estimate_zero_line_y(
+                    left_numbers=Lnumber,
+                    left_positions=Lpositions,
+                    right_numbers=Rnumber,
+                    right_positions=Rpositions,
                 )
 
-            # Estimate a global y=0 line (in image coordinates), using whatever
-            # sides are available. The helper handles None gracefully.
-            y_zero = general_functions.estimate_zero_line_y(
-                left_numbers=Lnumber,
-                left_positions=Lpositions,
-                right_numbers=Rnumber,
-                right_positions=Rpositions,
-            )
-
-            if y_zero is not None:
-                logger.info(f"Estimated y=0 line at y={y_zero:.2f} for {input_image_filename}")
-        except Exception:
-            # These checks are purely diagnostic; never break the pipeline
-            traceback.print_exc()
-
+                if y_zero is not None:
+                    logger.info(f"Estimated y=0 line at y={y_zero:.2f} for {input_image_filename}")
+            except Exception:
+                # These checks are purely diagnostic; never break the pipeline
+                traceback.print_exc()
+        elif us_dicom:
+            y_zero = (dicom_metadata["RegionLocationMinY0"] + dicom_metadata["ReferencePixelY0"])
+        else:
+            pass
 
         try:
             try:  # Refine segmentation
@@ -313,9 +317,16 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                 Fail = Fail + 1
                 pass
 
-            Xplot, Yplot, Ynought = general_functions.plot_digitized_data_single_axis(
-                Rnumber, Rpositions, Lnumber, Lpositions, top_curve_coords,
-            )
+            if us_image:
+                Xplot, Yplot, Ynought = general_functions.plot_digitized_data_single_axis(
+                    Rnumber, Rpositions, Lnumber, Lpositions, top_curve_coords,
+                )
+            elif us_dicom:
+                Xplot, Yplot, Ynought = general_functions.plot_digitized_data_dicom(
+                    dicom_metadata, top_curve_coords=top_curve_coords,
+                )
+            else:
+                Xplot, Yplot, Ynought = [], [], []
 
             # Ensure axis masks are always defined. If either side failed axis
             # detection, fall back to an empty mask so that annotation still
@@ -334,6 +345,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                 Left_axis=ROIL,
                 Right_axis=ROIR,
             )
+            
             Annotated_path = output_dir + image_name.partition(".")[0] + "_Annotated.png"
             fig1, ax1 = plt.subplots(1)
             ax1.imshow(col)

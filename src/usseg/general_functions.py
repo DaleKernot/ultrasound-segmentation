@@ -1958,6 +1958,58 @@ def plot_digitized_data_single_axis(Rticks, Rlocs, Lticks, Llocs, top_curve_coor
     return Xplot, Yplot, Ynought
 
 
+def plot_digitized_data_dicom(dicom_metadata, top_curve_coords=None):
+    """
+    Digitize waveform for DICOM using metadata. Uses the same curve ordering as
+    plot_digitized_data_single_axis: one point per column, sorted left-to-right,
+    so plt.plot(Xplot, Yplot) draws a proper waveform.
+    """
+    Xplot, Yplot = [], []
+    Ynought = [float(dicom_metadata.get("ReferencePixelPhysicalValueY", 0.0))]
+
+    if top_curve_coords is None or len(top_curve_coords) == 0:
+        return Xplot, Yplot, Ynought
+
+    # --- Same ordering as single_axis: curve is [row, col], group by column, one point per column ---
+    # top_curve_coords: list of [row, col] (y_pixel, x_pixel) in arbitrary order
+    b_arr = [list(pt) for pt in top_curve_coords]
+    # Swap to [col, row] so we can group by column (index 0)
+    b_swapped = [pt[::-1] for pt in b_arr]
+    # One point per column: mean row (y) per column (x). Result rows stay in column order.
+    grouped = pd.DataFrame(b_swapped).groupby(0, as_index=False)[1].mean().values.tolist()
+    # Back to [row, col]; now sorted by column so we go left-to-right
+    b_clean = [pt[::-1] for pt in grouped]
+    # Optional: sort by column so X is strictly increasing (groupby may not guarantee order)
+    b_clean.sort(key=lambda pt: pt[1])
+
+    col_pixels = [pt[1] for pt in b_clean]   # x in image
+    row_pixels = [pt[0] for pt in b_clean]  # y in image
+
+    # --- Map pixel (col, row) to physical (X, Y) using DICOM metadata ---
+    min_x = dicom_metadata.get("RegionLocationMinX0")
+    min_y = dicom_metadata.get("RegionLocationMinY0")
+    ref_x0 = dicom_metadata.get("ReferencePixelX0", 0)
+    ref_y0 = dicom_metadata.get("ReferencePixelY0", 0)
+    x_ref = min_x + ref_x0
+    y_ref = min_y + ref_y0
+    x_ref_phys = float(dicom_metadata.get("ReferencePixelPhysicalValueX", 0.0))
+    y_ref_phys = float(dicom_metadata.get("ReferencePixelPhysicalValueY", 0.0))
+    dx = float(dicom_metadata.get("PhysicalDeltaX", 1.0))
+    dy = float(dicom_metadata.get("PhysicalDeltaY", 1.0))
+    dy = -abs(dy)
+
+    col_pixels = np.asarray(col_pixels, dtype=float)
+    row_pixels = np.asarray(row_pixels, dtype=float)
+
+    Xplot = x_ref_phys + (col_pixels - x_ref) * dx
+    Yplot = y_ref_phys + (row_pixels - y_ref) * dy
+
+    plt.plot(Xplot, Yplot, "-")
+    plt.xlabel("Physical X (time or distance)")
+    plt.ylabel("Physical Y (e.g. velocity)")
+    return Xplot, Yplot, Ynought
+
+
 def plot_correction(Xplot, Yplot, df):
     """
     Adjusts and corrects the digitized waveform data using extracted text data, identifies
