@@ -1943,11 +1943,10 @@ def plot_digitized_data_single_axis(Rticks, Rlocs, Lticks, Llocs, top_curve_coor
     # Map pixel y to physical value using the axis calibration
     Yplot = [a * y + b for y in Y_pixels]
 
-    # Invert waveform if mean is negative (same heuristic as original)
+    # Invert waveform if mean is negative
     if np.mean(Yplot) < 0:
         Yplot = [y * (-1) for y in Yplot]
 
-    # In this simplified scheme, y=0 in digitized space is just 0
     Ynought = [0.0]
 
     plt.figure(2)
@@ -2009,6 +2008,10 @@ def plot_digitized_data_dicom(dicom_metadata, top_curve_coords=None):
     plt.plot(Xplot, Yplot, "-")
     plt.xlabel("Physical X (time or distance)")
     plt.ylabel("Physical Y (e.g. velocity)")
+
+    # Convert to lists so output matches plot_digitized_data_single_axis
+    Xplot = list(Xplot)
+    Yplot = list(Yplot)
     return Xplot, Yplot, Ynought
 
 
