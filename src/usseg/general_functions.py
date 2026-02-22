@@ -2112,19 +2112,31 @@ def waveform_metrics_from_digitized(Xplot, Yplot):
             return empty_df
         # --- End improved beat detection ---
 
-        PS = float(statistics.mean(y[peaks]))
-        ED = float(statistics.mean(y[troughs]))
+        # SQI: keep only beats that pass template-correlation filter; metrics and markers use these.
+        peaks_f = peaks
+        troughs_f = troughs
+        good_peaks_mask, good_troughs_mask = _sqi_template_correlation(
+            y, peaks, troughs, template_len=200, min_corr=0.85
+        )
+        if np.any(good_peaks_mask) and np.any(good_troughs_mask):
+            peaks_f = peaks[good_peaks_mask]
+            troughs_f = troughs[good_troughs_mask]
+
+        PS = float(statistics.mean(y[peaks_f]))
+        ED = float(statistics.mean(y[troughs_f]))
         if ED == 0:
             ED = np.finfo(float).eps
         SoverD = PS / ED
         RI = (PS - ED) / PS if PS != 0 else 0.0
         TAmax = (PS + 2 * ED) / 3.0
 
-        # Add peak/trough markers to figure 2 so the saved digitized image shows each beat
-        if len(x) == len(y):
+        # Add peak/trough markers for usable beats only (SQI-filtered) so saved digitized image matches metrics.
+        if len(x) == len(y) and (len(peaks_f) > 0 or len(troughs_f) > 0):
             plt.figure(2)
-            plt.plot(x[peaks], y[peaks], "x", color="C0", markersize=8, label="PS")
-            plt.plot(x[troughs], y[troughs], "x", color="C1", markersize=8, label="ED")
+            if len(peaks_f) > 0:
+                plt.plot(x[peaks_f], y[peaks_f], "x", color="C0", markersize=8, label="PS")
+            if len(troughs_f) > 0:
+                plt.plot(x[troughs_f], y[troughs_f], "x", color="C1", markersize=8, label="ED")
 
         words = ["PS", "ED", "S/D", "RI", "TA"]
         values = [round(PS, 2), round(ED, 2), round(SoverD, 2), round(RI, 2), round(TAmax, 2)]
@@ -2138,19 +2150,154 @@ def waveform_metrics_from_digitized(Xplot, Yplot):
         return empty_df
 
 
+def _beat_detection_pass(x, y, min_distance):
+    """
+    Single pass of beat detection: smooth y, find_peaks with distance and prominence,
+    notch merge, ED as minimum between consecutive peaks. Returns (peaks, troughs) as int arrays,
+    or (None, None) if detection fails. Caller supplies min_distance (samples) appropriate for
+    x units (length-based for arbitrary x, time-based for time-scaled x).
+    """
+    if len(y) < 3 or len(x) != len(y):
+        return None, None
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    # Smooth y to reduce digitisation jitter; detection uses y_s.
+    y_s = pd.Series(y).rolling(window=5, center=True, min_periods=1).median().to_numpy()
+    # X spacing: needed for merge window (samples per beat) in notch suppression.
+    if len(x) >= 2:
+        dx = float(np.median(np.diff(x)))
+    else:
+        dx = 1.0
+    if not np.isfinite(dx) or dx <= 0:
+        dx = 1.0
+
+    # Prominence: ignore small bumps; 20% of 5–95% amplitude range.
+    amp = float(np.percentile(y_s, 95) - np.percentile(y_s, 5))
+    prom = 0.20 * amp
+    if not np.isfinite(prom) or prom <= 0:
+        prom = None
+
+    # find_peaks with distance (min_distance from caller function) and prominence.
+    peaks, _ = find_peaks(y_s, distance=min_distance, prominence=prom)
+    if len(peaks) == 0:
+        return None, None
+
+    # Notch merge: multiple peaks in one beat → keep only the tallest per window.
+    if len(peaks) >= 3:
+        median_pp = float(np.median(np.diff(x[peaks])))
+        merge_window_s = 0.45 * median_pp
+        merge_window_samples = max(1, int(merge_window_s / dx))
+    else:
+        merge_window_samples = min_distance
+    consolidated = []
+    i = 0
+    while i < len(peaks):
+        j = i
+        best = int(peaks[i])
+        while j + 1 < len(peaks) and (int(peaks[j + 1]) - int(peaks[j])) <= merge_window_samples:
+            j += 1
+            cand = int(peaks[j])
+            if y_s[cand] > y_s[best]:
+                best = cand
+        consolidated.append(best)
+        i = j + 1
+    peaks = np.array(consolidated, dtype=int)
+
+    # ED = minimum between consecutive systolic peaks.
+    trough_list = []
+    for i in range(len(peaks) - 1):
+        a, b = int(peaks[i]), int(peaks[i + 1])
+        if b > a + 1:
+            seg = y_s[a:b]
+            trough_list.append(a + int(np.argmin(seg)))
+    troughs = np.array(trough_list, dtype=int)
+    if len(troughs) == 0:
+        return None, None
+    return peaks, troughs
+
+
+def _sqi_template_correlation(y, peaks, troughs, template_len=200, min_corr=0.85):
+    """
+    SQI: cycle shape consistency via template correlation. Each beat is defined as
+    peak-to-peak (segment from peaks[i] to peaks[i+1]). Beats are resampled to a
+    fixed length, median template is built, and each beat is correlated to the template;
+    beats below min_corr are rejected. With one beat, template equals that beat (corr=1).
+
+    Returns:
+        good_peaks_mask (np.ndarray bool): length len(peaks); True = keep for metrics/plot.
+        good_troughs_mask (np.ndarray bool): length len(troughs); True = keep.
+    If SQI cannot be applied (e.g. too few points), returns all True (no filtering).
+    """
+    y = np.asarray(y, dtype=float)
+    peaks = np.asarray(peaks, dtype=int)
+    troughs = np.asarray(troughs, dtype=int)
+    n_peaks = len(peaks)
+    n_troughs = len(troughs)
+    # Expect one trough between each pair of consecutive peaks.
+    if n_peaks < 2 or n_troughs != n_peaks - 1:
+        return np.ones(n_peaks, dtype=bool), np.ones(n_troughs, dtype=bool)
+
+    n_beats = n_peaks - 1
+    # Resample each beat (peak[i] -> peak[i+1]) to template_len points.
+    resampled = np.zeros((n_beats, template_len))
+    for i in range(n_beats):
+        a, b = int(peaks[i]), int(peaks[i + 1])
+        if b <= a + 1:
+            resampled[i, :] = np.nan
+            continue
+        seg = y[a : b + 1]
+        x_old = np.linspace(0, 1, len(seg))
+        x_new = np.linspace(0, 1, template_len)
+        resampled[i, :] = np.interp(x_new, x_old, seg)
+
+    # Drop beats that are all NaN or constant (would break correlation).
+    valid = np.ones(n_beats, dtype=bool)
+    for i in range(n_beats):
+        r = resampled[i, :]
+        if np.any(np.isnan(r)) or np.std(r) < 1e-10:
+            valid[i] = False
+    if np.sum(valid) == 0:
+        return np.ones(n_peaks, dtype=bool), np.ones(n_troughs, dtype=bool)
+
+    # Median template (over valid beats only).
+    template = np.nanmedian(resampled[valid, :], axis=0)
+    if np.std(template) < 1e-10:
+        return np.ones(n_peaks, dtype=bool), np.ones(n_troughs, dtype=bool)
+
+    # Pearson correlation of each (valid) beat to template.
+    good_beat = np.zeros(n_beats, dtype=bool)
+    for i in range(n_beats):
+        if not valid[i]:
+            good_beat[i] = False
+            continue
+        r = resampled[i, :]
+        c = np.corrcoef(r, template)[0, 1]
+        good_beat[i] = c >= min_corr if np.isfinite(c) else False
+
+    # If all beats rejected, keep all (fallback: no filtering).
+    if not np.any(good_beat):
+        return np.ones(n_peaks, dtype=bool), np.ones(n_troughs, dtype=bool)
+
+    # Map beat quality to peak/trough masks. Peak i is in beat i-1 (start) and beat i (end); trough i is in beat i only.
+    good_peaks_mask = np.zeros(n_peaks, dtype=bool)
+    good_peaks_mask[0] = good_beat[0]
+    good_peaks_mask[-1] = good_beat[-1]
+    for i in range(1, n_peaks - 1):
+        good_peaks_mask[i] = good_beat[i - 1] or good_beat[i]
+    good_troughs_mask = good_beat.copy()
+    return good_peaks_mask, good_troughs_mask
+
+
 def plot_correction(Xplot, Yplot, df):
     """
     Adjusts and corrects the digitized waveform data using extracted text data, identifies
     and filters peaks and troughs, computes hemodynamic parameters, scales the time axis,
     and plots the corrected waveform.
 
-    The function works by first inserting a new column for digitized values in the DataFrame.
-    It processes the waveform to identify and filter peaks and troughs, computes key 
-    hemodynamic parameters (PS, ED, S/D, RI, TAmax, PI), and updates these values in the
-    DataFrame. It also scales the x-axis to real-time based on heart rate information and
-    generates a plot of the corrected waveform.
-
-    Exceptions are handled by printing traceback information.
+    Two-pass beat detection: first on arbitrary x (to get period for scaling), then after
+    time-scaling with HR the second pass uses time-based spacing. Metrics use the second
+    pass when available, else the first.
 
     Args:
         Xplot (list of float): The x-coordinates (time axis) of the waveform data.
@@ -2161,102 +2308,126 @@ def plot_correction(Xplot, Yplot, df):
     Returns:
         **df** (pandas.DataFrame): The DataFrame updated with computed parameters in the "Digitized Value" column.
     """
+    y = np.array(Yplot, dtype=float)
+    x = np.array(Xplot, dtype=float)
+    df.insert(loc=3, column="Digitized Value", value="")
+    peaks = np.array([], dtype=int)
+    troughs = np.array([], dtype=int)
+    peaks_for_metrics = np.array([], dtype=int)
+    troughs_for_metrics = np.array([], dtype=int)
+    arbitrary_period = 1.0
+    x_time = None
 
     try:
-        # import Jinja2
-        y = np.array(Yplot)
-        x = np.array(Xplot)
-        # DF = df
-        df.insert(loc=3, column="Digitized Value", value="")
-        peaks, _ = find_peaks(y)  # PSV
-        troughs, _ = find_peaks(-y)  # EDV
-        # filter out any anomalous signals:
-        trough_widths, _, _, _ = peak_widths(-y, troughs)
-        mean_widths_troughs = statistics.mean(trough_widths)
-        # filter out anomalous peaks
-        valid_troughs = []
-        for i in range(len(troughs)):
-            if trough_widths[i] > (mean_widths_troughs / 2):
-                valid_troughs.append(troughs[i])
-        troughs = valid_troughs
+        # First pass: beat detection on arbitrary x [0, 1]. Length-based min distance
+        # (assume at most ~15 beats in strip). Gives peaks/troughs and mean period for scaling.
+        # -------------------------------------------------------------------------
+        if len(y) >= 3 and len(x) == len(y):
+            min_distance_pass1 = max(1, len(x) // 15)
+            peaks_pass1, troughs_pass1 = _beat_detection_pass(x, y, min_distance_pass1)
+            if peaks_pass1 is not None and troughs_pass1 is not None:
+                peaks = peaks_pass1
+                troughs = troughs_pass1
+                if len(peaks) >= 2:
+                    arbitrary_period = float(x[peaks[-1]] - x[peaks[0]]) / max(1, len(peaks) - 1)
+                else:
+                    arbitrary_period = 1.0
 
-        results_half = peak_widths(y, peaks)
-        widths_of_peaks = results_half[0]
-        mean_widths_peaks = statistics.mean(widths_of_peaks)
-        valid_peaks = []
-        for i in range(len(peaks)):
-            if widths_of_peaks[i] > (mean_widths_peaks / 2) and y[peaks[i]] > (
-                    statistics.mean(y[peaks]) * 0.8
-            ):
-                valid_peaks.append(peaks[i])
-        peaks = valid_peaks
+        # -------------------------------------------------------------------------
+        # Time scaling: get HR from df and scale x -> x_time (seconds). If HR is
+        # missing or invalid we skip scaling and keep arbitrary x for plotting.
+        # -------------------------------------------------------------------------
+        try:
+            hr_vals = df.loc[df["Word"].str.contains("HR"), "Value"].values
+            hr = float(hr_vals[0]) if len(hr_vals) > 0 else 0.0
+            if np.isfinite(hr) and hr > 0.0:
+                real_period = 60.0 / hr
+                scale_factor = real_period / arbitrary_period
+                x_time = x * scale_factor
+            else:
+                x_time = x.copy()
+        except Exception:
+            x_time = x.copy()
 
-        # Peak systolic
-        PS = statistics.mean(y[peaks])
-        # End diastolic
-        ED = statistics.mean(y[troughs])
-        # Find S/D
-        SoverD = statistics.mean(y[peaks]) / statistics.mean(y[troughs])
-        # Find RI
-        RI = (
-                     statistics.mean(y[peaks]) - statistics.mean(y[troughs])
-             ) / statistics.mean(y[peaks])
-        # Find TAmax
-        TAmax = (statistics.mean(y[peaks]) + (2 * statistics.mean(y[troughs]))) / 3
-        # Find PI
-        PI = (
-                     statistics.mean(y[peaks]) - statistics.mean(y[troughs])
-             ) / statistics.mean(y)
+        # Second pass: beat detection on time-scaled x when available. Time-based min
+        # distance (200 bpm). If this succeeds we use these peaks/troughs; else keep first pass.
+        # -------------------------------------------------------------------------
+        if x_time is not None and len(x_time) == len(y) and np.any(x_time != x):
+            dx_s = float(np.median(np.diff(x_time))) if len(x_time) >= 2 else 1.0
+            if np.isfinite(dx_s) and dx_s > 0:
+                min_sep_s = 60.0 / 200.0
+                min_distance_pass2 = max(1, int(min_sep_s / dx_s))
+                peaks_pass2, troughs_pass2 = _beat_detection_pass(x_time, y, min_distance_pass2)
+                if peaks_pass2 is not None and troughs_pass2 is not None and len(peaks_pass2) > 0 and len(troughs_pass2) > 0:
+                    peaks = peaks_pass2
+                    troughs = troughs_pass2
 
-        words = ["PS", "ED", "S/D", "RI", "TA"]
-        values = [PS, ED, SoverD, RI, TAmax]
-        values = [round(elem, 2) for elem in values]
-        # Loop through each word and value
-        for i in range(len(words)):
-            word = words[i]
-            value = values[i]
-            try:
-                # Find rows where word is in "Text" column, and set corresponding "Value" to the value
-                df.loc[df["Word"].str.contains(word), "Digitized Value"] = value
+        # SQI: keep only beats that pass template-correlation filter. Metrics and plot
+        # use these peaks/troughs only.
+        # -------------------------------------------------------------------------
+        peaks_for_metrics = peaks
+        troughs_for_metrics = troughs
+        if len(peaks) > 0 and len(troughs) > 0:
+            good_peaks_mask, good_troughs_mask = _sqi_template_correlation(
+                y, peaks, troughs, template_len=200, min_corr=0.85
+            )
+            if np.any(good_peaks_mask) and np.any(good_troughs_mask):
+                peaks_for_metrics = peaks[good_peaks_mask]
+                troughs_for_metrics = troughs[good_troughs_mask]
 
-                # get_colour(df.loc[df["Word"].str.contains(word),'Value'].values[0],value)
-            except Exception:
-                continue
+        # Metrics from filtered peaks/troughs. Use original y; guard ED for S/D and RI.
+        # -------------------------------------------------------------------------
+        if len(peaks_for_metrics) > 0 and len(troughs_for_metrics) > 0:
+            PS = float(statistics.mean(y[peaks_for_metrics]))
+            ED = float(statistics.mean(y[troughs_for_metrics]))
+            if ED == 0:
+                ED = np.finfo(float).eps
+            SoverD = PS / ED
+            RI = (PS - ED) / PS if PS != 0 else 0.0
+            TAmax = (PS + 2 * ED) / 3.0
+            PI = (PS - ED) / float(np.mean(y)) if np.mean(y) != 0 else 0.0
+            words = ["PS", "ED", "S/D", "RI", "TA"]
+            values = [round(PS, 2), round(ED, 2), round(SoverD, 2), round(RI, 2), round(TAmax, 2)]
+            for i in range(len(words)):
+                try:
+                    df.loc[df["Word"].str.contains(words[i]), "Digitized Value"] = values[i]
+                except Exception:
+                    continue
 
-        # Period of the signal in arbitrary scale
-        arbitrary_period = (x[peaks[-1]] - x[peaks[1]]) / (len(peaks) - 2)
     except Exception:
-        traceback.print_exc()  # prints the error message and traceback
+        traceback.print_exc()
+        arbitrary_period = 1.0
 
+    # Plot digitization: usable beat markers only. Time-scaled x when HR valid;
+    # arbitrary x when HR invalid so markers are still drawn.
+    # -------------------------------------------------------------------------
     try:
-        # HR in bpm from extracted text
         hr_vals = df.loc[df["Word"].str.contains("HR"), "Value"].values
         hr = float(hr_vals[0]) if len(hr_vals) > 0 else 0.0
+        if np.isfinite(hr) and hr > 0.0:
+            real_period = 1.0 / (hr / 60.0)
+            scale_factor = real_period / arbitrary_period
+            x_plot = x * scale_factor
+            xlabel = "Time (s)"
+        else:
+            logger.warning("Invalid HR value for time scaling (%s); plotting on arbitrary x with beat markers.", hr)
+            x_plot = x
+            xlabel = "Arbitrary time scale"
 
-        # If HR is zero or invalid, skip time scaling 
-        if not np.isfinite(hr) or hr == 0.0:
-            logger.warning("Invalid HR value for time scaling (%s); skipping time scaling plot.", hr)
-            return df
-
-        # Period of the signal in real time scale from text extraction
-        real_period = 1.0 / (hr / 60.0)
-        # Calculate a scaling factor
-        scale_factor = real_period / arbitrary_period
-        x_time = x * scale_factor
         plt.close(2)
         plt.figure(2)
-        plt.plot(x_time, y)
-        plt.plot(x_time[peaks], y[peaks], "x")
-        plt.plot(x_time[troughs], y[troughs], "x")
-        # plt.plot(x_time[troughs[1:-1]],y[troughs[1:-1]],"x")
-        # Check if any value in x_time is NaN or zero
-        if not any(np.isnan(x) or x == 0 or np.isinf(x) for x in x_time):
-            plt.xlim((min(x_time), max(x_time)))
+        plt.plot(x_plot, y)
+        if len(peaks_for_metrics) > 0:
+            plt.plot(x_plot[peaks_for_metrics], y[peaks_for_metrics], "x", color="C0", markersize=8, label="PS")
+        if len(troughs_for_metrics) > 0:
+            plt.plot(x_plot[troughs_for_metrics], y[troughs_for_metrics], "x", color="C1", markersize=8, label="ED")
+        if not any(np.isnan(v) or v == 0 or np.isinf(v) for v in x_plot):
+            plt.xlim((min(x_plot), max(x_plot)))
         plt.ylim((0, max(y) + 10))
-        plt.xlabel("Time (s)")
+        plt.xlabel(xlabel)
         plt.ylabel("Flowrate (cm/s)")
     except Exception:
-        logger.warning("Could not plot time-scaled waveform; continuing.", exc_info=True)
+        logger.warning("Could not plot digitization waveform; continuing.", exc_info=True)
 
     return df
 
