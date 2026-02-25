@@ -17,7 +17,7 @@ dependencies = [
     "matplotlib",
     "numpy",
     "opencv-contrib-python",
-    "pandas < 3",
+    "pandas",
     "pydicom",
     "pytesseract",
     "scipy",
