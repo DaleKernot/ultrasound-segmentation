@@ -12,6 +12,7 @@ import pickle
 import matplotlib.pyplot as plt
 import cv2
 import numpy as np
+import pandas as pd
 import traceback
 import toml
 
@@ -87,50 +88,96 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
     Text_data = []  # text data extracted from image
     Annotated_scans = []
     Digitized_scans = []
+    # Paths for HTML column 1 (plain scan): same as input for images; for DICOM, a saved PNG (browser can't show .dcm)
+    scan_display_paths = []
 
-    for input_image_filename in filenames:  # Iterate through all file names and populate excel file
+    for idx, input_image_filename in enumerate(filenames):  # Iterate through all file names and populate excel file
         # input_image_filename = "E:/us-data-anon/0000/IHE_PDI/00003511/AA3A43F2/AAD8766D/0000371E\\EEEAE224.JPG"
         image_name = os.path.basename(input_image_filename)
+        base_name = image_name.partition(".")[0]
+        # Unique prefix so files with same basename (e.g. 001.dcm from different folders) don't overwrite
+        out_prefix = output_dir + f"{idx}_{base_name}"
         print(input_image_filename)
 
-        try:  # Try text extraction
-            colRGBA = Image.open(input_image_filename)  # These images are in RGBA form
-            # colRGBA = General_functions.upscale_to_fixed_longest_edge(colRGBA)  # upscale to longest edge
-            PIL_col = colRGBA.convert("RGB")  # We need RGB, so convert here. with PIL
-            cv2_img = cv2.imread(input_image_filename)  # with cv2.
-            # pix = (
-            #     col.load()
-            # )  # Loads a pixel access object, where pixel values can be edited
+        # Classify file type for downstream handling (image vs DICOM)
+        ext = os.path.splitext(input_image_filename)[1].lower()
+        us_dicom = ext in (".dcm", ".dicom")
+        # is_image: jpeg, png, or other common image formats
+        us_image = ext in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp")
 
-            # from General_functions import Colour_extract, Text_from_greyscale
-            COL = general_functions.colour_extract_vectorized(PIL_col, [255, 255, 100], 95, 95)
-            logger.info("Done Colour extract")
+        label_result = None  # DICOM only: vessel + side from yellow label text
+        # Path to show in HTML column 1 (plain scan). For DICOM we save a PNG so the browser can display it.
+        scan_display_path = input_image_filename
+        if us_dicom:
+            # DICOM files skip text extraction, but extract metadata. Do not append to Text_data here;
+            # we append the metrics DataFrame (or None on exception) later, once per file, like images.
+            logger.info(f"Processing DICOM file: {input_image_filename}")
+            dicom_metadata = general_functions.extract_dicom_metadata(input_image_filename)
+            PIL_image, cv2_img = general_functions.extract_doppler_from_dicom(input_image_filename)
+            # Save Doppler as PNG for HTML column 1 (raw .dcm bytes are not displayable as image in browser)
+            source_path = out_prefix + "_Source.png"
+            PIL_image.save(source_path)
+            scan_display_path = source_path
+            label_result = general_functions.extract_dicom_label_text(cv2_img)
+            Fail = 0
+        elif us_image:
+            try:  # Try text extraction
+                colRGBA = Image.open(input_image_filename)  # These images are in RGBA form
+                # colRGBA = General_functions.upscale_to_fixed_longest_edge(colRGBA)  # upscale to longest edge
+                PIL_col = colRGBA.convert("RGB")  # We need RGB, so convert here. with PIL
+                cv2_img = cv2.imread(input_image_filename)  # with cv2.
+                # pix = (
+                #     col.load()
+                # )  # Loads a pixel access object, where pixel values can be edited
 
-            Fail, df = general_functions.text_from_greyscale(cv2_img, COL)
-        except Exception:  # flat fail on 1
-            traceback.print_exc()  # prints the error message and traceback
-            logger.error("Failed Text extraction")
+                # from General_functions import Colour_extract, Text_from_greyscale
+                COL = general_functions.colour_extract_vectorized(PIL_col, [255, 255, 100], 95, 95)
+                logger.info("Done Colour extract")
+
+                Fail, df = general_functions.text_from_greyscale(cv2_img, COL)
+            except Exception:  # flat fail on 1
+                traceback.print_exc()  # prints the error message and traceback
+                logger.error("Failed Text extraction")
+                Text_data.append(None)
+                Fail = 0
+                pass
+        else:
+            # Unknown file type
+            logger.warning(f"Unknown file type for {input_image_filename}, skipping text extraction")
             Text_data.append(None)
             Fail = 0
-            pass
 
-        try:  # Try initial segmentation
-            segmentation_mask, Xmin, Xmax, Ymin, Ymax = general_functions.initial_segmentation(
-                input_image_obj=PIL_col
-            )
-        except Exception:  # flat fail on 1
-            logger.error("Failed Initial segmentation")
-            Fail = Fail + 1
-            pass
+        if us_image:
+            try:  # Try initial segmentation
+                segmentation_mask, Xmin, Xmax, Ymin, Ymax = general_functions.initial_segmentation(
+                    input_image_obj=PIL_col
+                )
+            except Exception:  # flat fail on 1
+                logger.error("Failed Initial segmentation")
+                Fail = Fail + 1
+                pass
 
-        try:  # define end ROIs
-            Left_dimensions, Right_dimensions = general_functions.define_end_rois(
-                segmentation_mask, Xmin, Xmax, Ymin, Ymax
-            )
-        except Exception:
-            logger.error("Failed Defining ROI")
-            Fail = Fail + 1
-            pass
+            try:  # define end ROIs
+                Left_dimensions, Right_dimensions = general_functions.define_end_rois(
+                    segmentation_mask, Xmin, Xmax, Ymin, Ymax
+                )
+            except Exception:
+                logger.error("Failed Defining ROI")
+                Fail = Fail + 1
+                pass
+        elif us_dicom:
+            # DICOM: extract bounding box coordinates from metadata
+            segmentation_mask = None
+            Xmin = dicom_metadata.get("RegionLocationMinX0")
+            Xmax = dicom_metadata.get("RegionLocationMaxX1")
+            Ymin = dicom_metadata.get("RegionLocationMinY0")
+            Ymax = dicom_metadata.get("RegionLocationMaxY1")
+            Left_dimensions = Right_dimensions = None
+        else:
+            # Unknown file type: skip segmentation and ROI definition
+            segmentation_mask = None
+            Xmin = Xmax = Ymin = Ymax = None
+            Left_dimensions = Right_dimensions = None
 
         try:
             Waveform_dimensions = [Xmin, Xmax, Ymin, Ymax]
@@ -149,121 +196,125 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
         ROIR = None
         y_zero = None
 
-        try:  # Search for ticks and labels - Left axis
-            (
-                Cs,
-                ROIAX,
-                CenPoints,
-                onY,
-                BCs,
-                TYLshift,
-                thresholded_image,
-                Side,
-                Left_dimensions,
-                Right_dimensions,
-                ROI2,
-                ROI3,
-            ) = general_functions.search_for_ticks(
-                cv2_img, "Left", Left_dimensions, Right_dimensions
-            )
-            ROIAX, Lnumber, Lpositions, ROIL = general_functions.search_for_labels(
-                Cs,
-                ROIAX,
-                CenPoints,
-                onY,
-                BCs,
-                TYLshift,
-                Side,
-                Left_dimensions,
-                Right_dimensions,
-                cv2_img,
-                ROI2,
-                ROI3,
-            )
-            # Validate and lightly clean left-axis ticks/labels
-            Lnumber, Lpositions = general_functions.validate_axis_ticks(
-                Lnumber, Lpositions, side="Left"
-            )
-        except Exception:
-            traceback.print_exc()  # prints the error message and traceback
-            logger.error("Failed Left Axes search")
+        if us_image:
+            try:  # Search for ticks and labels - Left axis
+                (
+                    Cs,
+                    ROIAX,
+                    CenPoints,
+                    onY,
+                    BCs,
+                    TYLshift,
+                    thresholded_image,
+                    Side,
+                    Left_dimensions,
+                    Right_dimensions,
+                    ROI2,
+                    ROI3,
+                ) = general_functions.search_for_ticks(
+                    cv2_img, "Left", Left_dimensions, Right_dimensions
+                )
+                ROIAX, Lnumber, Lpositions, ROIL = general_functions.search_for_labels(
+                    Cs,
+                    ROIAX,
+                    CenPoints,
+                    onY,
+                    BCs,
+                    TYLshift,
+                    Side,
+                    Left_dimensions,
+                    Right_dimensions,
+                    cv2_img,
+                    ROI2,
+                    ROI3,
+                )
+                # Validate and lightly clean left-axis ticks/labels
+                Lnumber, Lpositions = general_functions.validate_axis_ticks(
+                    Lnumber, Lpositions, side="Left"
+                )
+            except Exception:
+                traceback.print_exc()  # prints the error message and traceback
+                logger.error("Failed Left Axes search")
 
-            Fail = Fail + 1
-            pass
+                Fail = Fail + 1
+                pass
 
-        try:  # Search for ticks and labels - Right axis
-            (
-                Cs,
-                ROIAX,
-                CenPoints,
-                onY,
-                BCs,
-                TYLshift,
-                thresholded_image,
-                Side,
-                Left_dimensions,
-                Right_dimensions,
-                ROI2,
-                ROI3,
-            ) = general_functions.search_for_ticks(
-                cv2_img, "Right", Left_dimensions, Right_dimensions
-            )
-            ROIAX, Rnumber, Rpositions, ROIR = general_functions.search_for_labels(
-                Cs,
-                ROIAX,
-                CenPoints,
-                onY,
-                BCs,
-                TYLshift,
-                Side,
-                Left_dimensions,
-                Right_dimensions,
-                cv2_img,
-                ROI2,
-                ROI3,
-            )
-            # Validate and lightly clean right-axis ticks/labels
-            Rnumber, Rpositions = general_functions.validate_axis_ticks(
-                Rnumber, Rpositions, side="Right"
-            )
-        except Exception:
-            traceback.print_exc()  # prints the error message and traceback
-            logger.error("Failed Right Axes search")
+            try:  # Search for ticks and labels - Right axis
+                (
+                    Cs,
+                    ROIAX,
+                    CenPoints,
+                    onY,
+                    BCs,
+                    TYLshift,
+                    thresholded_image,
+                    Side,
+                    Left_dimensions,
+                    Right_dimensions,
+                    ROI2,
+                    ROI3,
+                ) = general_functions.search_for_ticks(
+                    cv2_img, "Right", Left_dimensions, Right_dimensions
+                )
+                ROIAX, Rnumber, Rpositions, ROIR = general_functions.search_for_labels(
+                    Cs,
+                    ROIAX,
+                    CenPoints,
+                    onY,
+                    BCs,
+                    TYLshift,
+                    Side,
+                    Left_dimensions,
+                    Right_dimensions,
+                    cv2_img,
+                    ROI2,
+                    ROI3,
+                )
+                # Validate and lightly clean right-axis ticks/labels
+                Rnumber, Rpositions = general_functions.validate_axis_ticks(
+                    Rnumber, Rpositions, side="Right"
+                )
+            except Exception:
+                traceback.print_exc()  # prints the error message and traceback
+                logger.error("Failed Right Axes search")
 
-            Fail = Fail + 1
-            pass
+                Fail = Fail + 1
+                pass
 
-        # Cross-check consistency between left and right axes where both exist
-        try:
-            axis_agree = None
+            # Cross-check consistency between left and right axes where both exist
+            try:
+                axis_agree = None
 
-            # Only attempt a strict left/right consistency check if both sides
-            # actually produced ticks and positions.
-            if (
-                Lnumber is not None
-                and Lpositions is not None
-                and Rnumber is not None
-                and Rpositions is not None
-            ):
-                axis_agree = general_functions.validate_axis_pair(
-                    Lnumber, Lpositions, Rnumber, Rpositions
+                # Only attempt a strict left/right consistency check if both sides
+                # actually produced ticks and positions.
+                if (
+                    Lnumber is not None
+                    and Lpositions is not None
+                    and Rnumber is not None
+                    and Rpositions is not None
+                ):
+                    axis_agree = general_functions.validate_axis_pair(
+                        Lnumber, Lpositions, Rnumber, Rpositions
+                    )
+
+                # Estimate a global y=0 line (in image coordinates), using whatever
+                # sides are available. The helper handles None gracefully.
+                y_zero = general_functions.estimate_zero_line_y(
+                    left_numbers=Lnumber,
+                    left_positions=Lpositions,
+                    right_numbers=Rnumber,
+                    right_positions=Rpositions,
                 )
 
-            # Estimate a global y=0 line (in image coordinates), using whatever
-            # sides are available. The helper handles None gracefully.
-            y_zero = general_functions.estimate_zero_line_y(
-                left_numbers=Lnumber,
-                left_positions=Lpositions,
-                right_numbers=Rnumber,
-                right_positions=Rpositions,
-            )
-
-            if y_zero is not None:
-                logger.info(f"Estimated y=0 line at y={y_zero:.2f} for {input_image_filename}")
-        except Exception:
-            # These checks are purely diagnostic; never break the pipeline
-            traceback.print_exc()
-
+                if y_zero is not None:
+                    logger.info(f"Estimated y=0 line at y={y_zero:.2f} for {input_image_filename}")
+            except Exception:
+                # These checks are purely diagnostic; never break the pipeline
+                traceback.print_exc()
+        elif us_dicom:
+            y_zero = (dicom_metadata["RegionLocationMinY0"] + dicom_metadata["ReferencePixelY0"])
+        else:
+            pass
 
         try:
             try:  # Refine segmentation
@@ -278,44 +329,86 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                 Fail = Fail + 1
                 pass
 
-            Xplot, Yplot, Ynought = general_functions.plot_digitized_data_single_axis(
-                Rnumber, Rpositions, Lnumber, Lpositions, top_curve_coords,
-            )
+            if us_image:
+                Xplot, Yplot, Ynought = general_functions.plot_digitized_data_single_axis(
+                    Rnumber, Rpositions, Lnumber, Lpositions, top_curve_coords,
+                )
+            elif us_dicom:
+                Xplot, Yplot, Ynought = general_functions.plot_digitized_data_dicom(
+                    dicom_metadata, top_curve_coords=top_curve_coords,
+                )
+            else:
+                Xplot, Yplot, Ynought = [], [], []
 
-            # Ensure axis masks are always defined. If either side failed axis
-            # detection, fall back to an empty mask so that annotation still
-            # runs without raising NameError / index errors.
-            if ROIL is None:
-                ROIL = np.zeros_like(refined_segmentation_mask, dtype=np.uint8)
-            if ROIR is None:
-                ROIR = np.zeros_like(refined_segmentation_mask, dtype=np.uint8)
+            # Annotation: image path uses axis masks and full annotate(), DICOM uses annotate_dicom() only.
+            if us_image:
+                # Ensure axis masks are always defined. If either side failed axis
+                # detection, fall back to an empty mask so that annotation still
+                # runs without raising NameError / index errors.
+                if ROIL is None:
+                    ROIL = np.zeros_like(refined_segmentation_mask, dtype=np.uint8)
+                if ROIR is None:
+                    ROIR = np.zeros_like(refined_segmentation_mask, dtype=np.uint8)
+                col = general_functions.annotate(
+                    input_image_obj=colRGBA,
+                    refined_segmentation_mask=refined_segmentation_mask,
+                    Left_dimensions=Left_dimensions,
+                    Right_dimensions=Right_dimensions,
+                    Waveform_dimensions=Waveform_dimensions,
+                    Left_axis=ROIL,
+                    Right_axis=ROIR,
+                )
+            elif us_dicom:
+                col = general_functions.annotate_dicom(
+                    input_image_obj=PIL_image,
+                    refined_segmentation_mask=refined_segmentation_mask,
+                    dicom_metadata=dicom_metadata,
+                )
+            else:
+                col = None
 
-            col = general_functions.annotate(
-                input_image_obj=colRGBA,
-                refined_segmentation_mask=refined_segmentation_mask,
-                Left_dimensions=Left_dimensions,
-                Right_dimensions=Right_dimensions,
-                Waveform_dimensions=Waveform_dimensions,
-                Left_axis=ROIL,
-                Right_axis=ROIR,
-            )
-            Annotated_path = output_dir + image_name.partition(".")[0] + "_Annotated.png"
-            fig1, ax1 = plt.subplots(1)
-            ax1.imshow(col)
-            ax1.set_xticks([])
-            ax1.set_yticks([])
-            ax1.tick_params(axis="both", which="both", length=0)
-            fig1.savefig(Annotated_path, dpi=900, bbox_inches="tight", pad_inches=0)
-            Annotated_scans.append(Annotated_path)
+            Annotated_path = out_prefix + "_Annotated.png"
+            if col is not None:
+                fig1, ax1 = plt.subplots(1)
+                ax1.imshow(col)
+                ax1.set_xticks([])
+                ax1.set_yticks([])
+                ax1.tick_params(axis="both", which="both", length=0)
+                fig1.savefig(Annotated_path, dpi=900, bbox_inches="tight", pad_inches=0)
+                Annotated_scans.append(Annotated_path)
+                scan_display_paths.append(scan_display_path)
+            else:
+                Annotated_scans.append(None)
+                scan_display_paths.append(scan_display_path)
 
-            try:
-                df = general_functions.plot_correction(Xplot, Yplot, df)
+            # Metrics/correction: images use plot_correction (text df + digitized); DICOM uses waveform metrics only.
+            if us_image:
+                try:
+                    df = general_functions.plot_correction(Xplot, Yplot, df)
+                    Text_data.append(df)
+                except Exception:
+                    traceback.print_exc()
+                    logger.error("Failed correction")
+                    continue
+            elif us_dicom:
+                df = general_functions.waveform_metrics_from_digitized(Xplot, Yplot)
+                # Prepend label row (vessel + side) at top of table for HTML
+                if label_result and not df.empty:
+                    label_str = " ".join(
+                        filter(None, [label_result.get("side"), label_result.get("vessel")])
+                    ).strip()
+                    if label_str:
+                        label_row = pd.DataFrame(
+                            [{"Line": 0, "Word": "Label", "Value": label_str, "Unit": "", "Digitized Value": ""}],
+                            columns=df.columns,
+                        )
+                        df = pd.concat([label_row, df], ignore_index=True)
+                    df["Line"] = range(1, len(df) + 1)
                 Text_data.append(df)
-            except Exception:
-                traceback.print_exc()
-                logger.error("Failed correction")
-                continue
-            Digitized_path = output_dir + image_name.partition(".")[0] + "_Digitized.png"
+            else:
+                Text_data.append(None)
+
+            Digitized_path = out_prefix + "_Digitized.png"
             plt.figure(2)
             plt.savefig(Digitized_path, dpi=900, bbox_inches="tight", pad_inches=0)
             Digitized_scans.append(Digitized_path)
@@ -323,6 +416,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
         except Exception:
             logger.error("Failed Digitization")
             Annotated_scans.append(None)
+            scan_display_paths.append(scan_display_path)
             traceback.print_exc()
             try:
                 Text_data.append(df)
@@ -364,7 +458,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
         if pickle_path is None:
             pickle_path = toml.load("config.toml")["pickle"]["segmented_data"]
         with open(pickle_path, "wb") as f:
-            pickle.dump([filenames, Digitized_scans, Annotated_scans, Text_data], f)
+            pickle.dump([scan_display_paths, Digitized_scans, Annotated_scans, Text_data], f)
     i = 0
     return filenames, Digitized_scans, Annotated_scans, Text_data
 

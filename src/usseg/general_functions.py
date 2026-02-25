@@ -23,6 +23,7 @@ import statistics
 import scipy.linalg
 from sklearn.cluster import DBSCAN
 import pandas as pd
+import pydicom
 import pytesseract
 from pytesseract import Output
 
@@ -73,6 +74,148 @@ def execute_on_main_thread_and_wait(func, *args, **kwargs):
 
         return result
 
+
+def extract_dicom_metadata(dicom_file_path):
+    """Extract specific metadata from a DICOM file.
+    
+    Args:
+        dicom_file_path (str): Path to the DICOM file.
+    
+    Returns:
+        dict: Dictionary containing extracted DICOM metadata fields.
+    """
+    try:
+        ds = pydicom.dcmread(dicom_file_path, stop_before_pixels=True)
+        metadata = {}
+
+        # Step 1: get (0018,6011) Sequence of Ultrasound Regions
+        us_region_elem = ds.get((0x0018, 0x6011), None)
+        if us_region_elem is None:
+            metadata["us_region_sequence_present"] = False
+            return metadata
+
+        metadata["us_region_sequence_present"] = True
+        metadata["num_us_regions"] = len(us_region_elem.value)
+        # Step 2: find PW spectral region (RegionSpatialFormat=3, RegionDataType=3)
+        pw_index = None
+        for i, item in enumerate(us_region_elem.value):
+            rsf_elem = item.get((0x0018, 0x6012), None)  # Region Spatial Format
+            rdt_elem = item.get((0x0018, 0x6014), None)  # Region Data Type
+            rsf = rsf_elem.value if rsf_elem else None
+            rdt = rdt_elem.value if rdt_elem else None
+
+            if rsf == 3 and rdt == 3:
+                pw_index = i
+                break
+
+        if pw_index is not None:
+            pw_region = us_region_elem.value[pw_index]
+
+            def get_tag(tag):
+                elem = pw_region.get(tag, None)
+                return elem.value if elem else None
+
+            # Bounding box (pixel coords in full image)
+            metadata["RegionLocationMinX0"] = get_tag((0x0018, 0x6018))
+            metadata["RegionLocationMinY0"] = get_tag((0x0018, 0x601A))
+            metadata["RegionLocationMaxX1"] = get_tag((0x0018, 0x601C))
+            metadata["RegionLocationMaxY1"] = get_tag((0x0018, 0x601E))
+
+            # Reference pixel (offsets within the region, per your doc)
+            metadata["ReferencePixelX0"] = get_tag((0x0018, 0x6020))
+            metadata["ReferencePixelY0"] = get_tag((0x0018, 0x6022))
+
+            # Physical units codes
+            metadata["PhysicalUnitsXDirection"] = get_tag((0x0018, 0x6024))
+            metadata["PhysicalUnitsYDirection"] = get_tag((0x0018, 0x6026))
+
+            # Physical value at the reference pixel
+            metadata["ReferencePixelPhysicalValueX"] = get_tag((0x0018, 0x6028))
+            metadata["ReferencePixelPhysicalValueY"] = get_tag((0x0018, 0x602A))
+
+            # Physical delta per pixel step
+            metadata["PhysicalDeltaX"] = get_tag((0x0018, 0x602C))
+            metadata["PhysicalDeltaY"] = get_tag((0x0018, 0x602E))
+        else:
+            metadata["pw_spectral_region_index"] = None
+
+        metadata["pw_spectral_region_index"] = pw_index
+
+        return metadata
+
+    except Exception as e:
+        logger.error(f"Failed to extract DICOM metadata from {dicom_file_path}: {e}")
+        return {}
+
+def extract_doppler_from_dicom(dicom_file_path):
+    """
+    Returns:
+        PIL_image (PIL.Image.Image)
+        cv2_image (np.ndarray)  # suitable for OpenCV (BGR for colour images)
+    """
+    ds = pydicom.dcmread(dicom_file_path)  # must read pixels
+    arr = ds.pixel_array  # numpy array
+
+    # Handle common cases: RGB (H,W,3) or MONOCHROME (H,W)
+    if arr.ndim == 3 and arr.shape[-1] == 3:
+        # pydicom gives RGB; PIL expects RGB; OpenCV expects BGR
+        PIL_image = Image.fromarray(arr.astype(np.uint8), mode="RGB")
+        cv2_image = arr[:, :, ::-1].astype(np.uint8)  # RGB -> BGR
+        return PIL_image, cv2_image
+
+    # Grayscale: ensure uint8
+    if arr.ndim == 2:
+        if arr.dtype != np.uint8:
+            # normalize to 0..255 (simple + safe default)
+            a = arr.astype(np.float32)
+            a -= a.min()
+            denom = (a.max() - a.min()) or 1.0
+            a = (a / denom * 255.0).astype(np.uint8)
+        else:
+            a = arr
+        PIL_image = Image.fromarray(a, mode="L")
+        cv2_image = a  # OpenCV grayscale
+        return PIL_image, cv2_image
+
+    raise ValueError(f"Unsupported pixel array shape: {arr.shape}, dtype={arr.dtype}")
+
+def debug_plot_doppler_overlay(PIL_image, metadata, ref_is_relative=True):
+    """
+    Plot Doppler image with:
+      - bounding box corners/outline
+      - reference pixel marker
+
+    ref_is_relative=True means ReferencePixelX0/Y0 are offsets from MinX0/MinY0
+    (common for USRegionSequence items).
+    """
+    img = np.array(PIL_image)
+
+    x0 = metadata.get("RegionLocationMinX0")
+    y0 = metadata.get("RegionLocationMinY0")
+    x1 = metadata.get("RegionLocationMaxX1")
+    y1 = metadata.get("RegionLocationMaxY1")
+    rx = metadata.get("ReferencePixelX0")
+    ry = metadata.get("ReferencePixelY0")
+
+    plt.figure()
+    plt.imshow(img)
+    plt.axis("off")
+
+    # Bounding box
+    if None not in (x0, y0, x1, y1):
+        plt.plot([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0], linewidth=2)
+        plt.scatter([x0, x1, x1, x0], [y0, y0, y1, y1], s=30)
+
+    # Reference pixel
+    if None not in (rx, ry):
+        if ref_is_relative and None not in (x0, y0):
+            rx_abs, ry_abs = x0 + rx, y0 + ry
+        else:
+            rx_abs, ry_abs = rx, ry
+        plt.scatter([rx_abs], [ry_abs], s=70, marker="x")
+        plt.text(rx_abs + 5, ry_abs + 5, "ref", fontsize=10)
+
+    plt.show()
 
 def initial_segmentation(input_image_obj):
     """
@@ -1800,11 +1943,10 @@ def plot_digitized_data_single_axis(Rticks, Rlocs, Lticks, Llocs, top_curve_coor
     # Map pixel y to physical value using the axis calibration
     Yplot = [a * y + b for y in Y_pixels]
 
-    # Invert waveform if mean is negative (same heuristic as original)
+    # Invert waveform if mean is negative
     if np.mean(Yplot) < 0:
         Yplot = [y * (-1) for y in Yplot]
 
-    # In this simplified scheme, y=0 in digitized space is just 0
     Ynought = [0.0]
 
     plt.figure(2)
@@ -1815,19 +1957,347 @@ def plot_digitized_data_single_axis(Rticks, Rlocs, Lticks, Llocs, top_curve_coor
     return Xplot, Yplot, Ynought
 
 
+def plot_digitized_data_dicom(dicom_metadata, top_curve_coords=None):
+    """
+    Digitize waveform for DICOM using metadata. Uses the same curve ordering as
+    plot_digitized_data_single_axis: one point per column, sorted left-to-right,
+    so plt.plot(Xplot, Yplot) draws a proper waveform.
+    """
+    Xplot, Yplot = [], []
+    Ynought = [float(dicom_metadata.get("ReferencePixelPhysicalValueY", 0.0))]
+
+    if top_curve_coords is None or len(top_curve_coords) == 0:
+        return Xplot, Yplot, Ynought
+
+    # --- Same ordering as single_axis: curve is [row, col], group by column, one point per column ---
+    # top_curve_coords: list of [row, col] (y_pixel, x_pixel) in arbitrary order
+    b_arr = [list(pt) for pt in top_curve_coords]
+    # Swap to [col, row] so we can group by column (index 0)
+    b_swapped = [pt[::-1] for pt in b_arr]
+    # One point per column: mean row (y) per column (x). Result rows stay in column order.
+    grouped = pd.DataFrame(b_swapped).groupby(0, as_index=False)[1].mean().values.tolist()
+    # Back to [row, col]; now sorted by column so we go left-to-right
+    b_clean = [pt[::-1] for pt in grouped]
+    # Optional: sort by column so X is strictly increasing (groupby may not guarantee order)
+    b_clean.sort(key=lambda pt: pt[1])
+
+    col_pixels = [pt[1] for pt in b_clean]   # x in image
+    row_pixels = [pt[0] for pt in b_clean]  # y in image
+
+    # --- Map pixel (col, row) to physical (X, Y) using DICOM metadata ---
+    min_x = dicom_metadata.get("RegionLocationMinX0")
+    min_y = dicom_metadata.get("RegionLocationMinY0")
+    ref_x0 = dicom_metadata.get("ReferencePixelX0", 0)
+    ref_y0 = dicom_metadata.get("ReferencePixelY0", 0)
+    x_ref = min_x + ref_x0
+    y_ref = min_y + ref_y0
+    x_ref_phys = float(dicom_metadata.get("ReferencePixelPhysicalValueX", 0.0))
+    y_ref_phys = float(dicom_metadata.get("ReferencePixelPhysicalValueY", 0.0))
+    dx = float(dicom_metadata.get("PhysicalDeltaX", 1.0))
+    dy = float(dicom_metadata.get("PhysicalDeltaY", 1.0))
+    dy = -abs(dy)
+
+    col_pixels = np.asarray(col_pixels, dtype=float)
+    row_pixels = np.asarray(row_pixels, dtype=float)
+
+    Xplot = x_ref_phys + (col_pixels - x_ref) * dx
+    Yplot = y_ref_phys + (row_pixels - y_ref) * dy
+
+    plt.figure(2)
+    plt.clf()  # clear so each DICOM file gets a fresh plot (no accumulation from previous files)
+    plt.plot(Xplot, Yplot, "-")
+    plt.xlabel("Physical X (time or distance)")
+    plt.ylabel("Physical Y (e.g. velocity)")
+
+    # Convert to lists so output matches plot_digitized_data_single_axis
+    Xplot = list(Xplot)
+    Yplot = list(Yplot)
+    return Xplot, Yplot, Ynought
+
+
+def waveform_metrics_from_digitized(Xplot, Yplot):
+    """
+    Compute waveform metrics from digitized x,y: Peak systolic (PS), End diastolic (ED),
+    and metrics derived only from those: S/D, RI, TAmax. Used for DICOM; returns a
+    DataFrame with the same structure so downstream (Text_data, export, HTML) can use it.
+
+    Derived:
+      S/D   = PS / ED
+      RI    = (PS - ED) / PS   (resistive index)
+      TAmax = (PS + 2*ED) / 3  (time-averaged maximum)
+
+    Args:
+        Xplot (list of float): X coordinates (time or physical axis).
+        Yplot (list of float): Y coordinates (e.g. velocity).
+
+    Returns:
+        pandas.DataFrame: Columns Line, Word, Value, Unit, Digitized Value.
+            One row per metric: PS, ED, S/D, RI, TA (TAmax). Value and Digitized Value
+            are set to the computed value; Unit is empty.
+    """
+    columns = ["Line", "Word", "Value", "Unit", "Digitized Value"]
+    empty_df = pd.DataFrame(columns=columns)
+
+    if Xplot is None or Yplot is None or len(Xplot) == 0 or len(Yplot) == 0 or len(Xplot) != len(Yplot):
+        return empty_df
+
+    y = np.array(Yplot, dtype=float)
+    if len(y) < 3:
+        return empty_df
+
+    try:
+        # --- Improved beat detection (with notch suppression) ---
+        x = np.array(Xplot, dtype=float)
+
+        # Light smoothing to suppress digitisation jaggies (robust, minimal distortion)
+        y_s = pd.Series(y).rolling(window=5, center=True, min_periods=1).median().to_numpy()
+
+        # Estimate sampling interval from X axis (seconds per sample if Xplot is time)
+        if len(x) >= 2:
+            dx = float(np.median(np.diff(x)))
+        else:
+            dx = 1.0
+        if not np.isfinite(dx) or dx <= 0:
+            dx = 1.0
+
+        # Plausible HR constraints -> minimum separation between systolic peaks
+        max_bpm = 200
+        min_sep_s = 60.0 / max_bpm
+        min_distance = max(1, int(min_sep_s / dx))
+
+        # Adaptive prominence threshold based on robust amplitude
+        amp = float(np.percentile(y_s, 95) - np.percentile(y_s, 5))
+        prom = 0.20 * amp  # 10% of amplitude; tune if needed
+        if not np.isfinite(prom) or prom <= 0:
+            prom = None  # let find_peaks decide if amplitude is degenerate
+
+        peaks, _ = find_peaks(y_s, distance=min_distance, prominence=prom)
+
+        if len(peaks) == 0:
+            return empty_df
+
+        # Notch suppression: if multiple peaks occur within a beat window, keep only the tallest.
+        if len(peaks) >= 3:
+            median_pp = float(np.median(np.diff(x[peaks])))      # seconds (or X units)
+            merge_window_s = 0.45 * median_pp                    # 0.35–0.55 works well
+            merge_window_samples = max(1, int(merge_window_s / dx))
+        else:
+            merge_window_samples = min_distance
+
+        consolidated = []
+        i = 0
+        while i < len(peaks):
+            j = i
+            best = int(peaks[i])
+            while j + 1 < len(peaks) and (int(peaks[j + 1]) - int(peaks[j])) <= merge_window_samples:
+                j += 1
+                cand = int(peaks[j])
+                if y_s[cand] > y_s[best]:
+                    best = cand
+            consolidated.append(best)
+            i = j + 1
+
+        peaks = np.array(consolidated, dtype=int)
+
+        # End-diastolic troughs: minimum between consecutive peaks (more stable than find_peaks(-y))
+        trough_list = []
+        for i in range(len(peaks) - 1):
+            a, b = int(peaks[i]), int(peaks[i + 1])
+            if b > a + 1:
+                seg = y_s[a:b]
+                trough_list.append(a + int(np.argmin(seg)))
+        troughs = np.array(trough_list, dtype=int)
+
+        if len(troughs) == 0:
+            return empty_df
+        # --- End improved beat detection ---
+
+        # SQI: keep only beats that pass template-correlation filter; metrics and markers use these.
+        peaks_f = peaks
+        troughs_f = troughs
+        good_peaks_mask, good_troughs_mask = _sqi_template_correlation(
+            y, peaks, troughs, template_len=200, min_corr=0.85
+        )
+        if np.any(good_peaks_mask) and np.any(good_troughs_mask):
+            peaks_f = peaks[good_peaks_mask]
+            troughs_f = troughs[good_troughs_mask]
+
+        PS = float(statistics.mean(y[peaks_f]))
+        ED = float(statistics.mean(y[troughs_f]))
+        if ED == 0:
+            ED = np.finfo(float).eps
+        SoverD = PS / ED
+        RI = (PS - ED) / PS if PS != 0 else 0.0
+        TAmax = (PS + 2 * ED) / 3.0
+
+        # Add peak/trough markers for usable beats only (SQI-filtered) so saved digitized image matches metrics.
+        if len(x) == len(y) and (len(peaks_f) > 0 or len(troughs_f) > 0):
+            plt.figure(2)
+            if len(peaks_f) > 0:
+                plt.plot(x[peaks_f], y[peaks_f], "x", color="C0", markersize=8, label="PS")
+            if len(troughs_f) > 0:
+                plt.plot(x[troughs_f], y[troughs_f], "x", color="C1", markersize=8, label="ED")
+
+        words = ["PS", "ED", "S/D", "RI", "TA"]
+        values = [round(PS, 2), round(ED, 2), round(SoverD, 2), round(RI, 2), round(TAmax, 2)]
+        rows = [
+            {"Line": i + 1, "Word": w, "Value": v, "Unit": "", "Digitized Value": v}
+            for i, (w, v) in enumerate(zip(words, values))
+        ]
+        return pd.DataFrame(rows, columns=columns)
+    except Exception:
+        logger.warning("waveform_metrics_from_digitized failed", exc_info=True)
+        return empty_df
+
+
+def _beat_detection_pass(x, y, min_distance):
+    """
+    Single pass of beat detection: smooth y, find_peaks with distance and prominence,
+    notch merge, ED as minimum between consecutive peaks. Returns (peaks, troughs) as int arrays,
+    or (None, None) if detection fails. Caller supplies min_distance (samples) appropriate for
+    x units (length-based for arbitrary x, time-based for time-scaled x).
+    """
+    if len(y) < 3 or len(x) != len(y):
+        return None, None
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    # Smooth y to reduce digitisation jitter; detection uses y_s.
+    y_s = pd.Series(y).rolling(window=5, center=True, min_periods=1).median().to_numpy()
+    # X spacing: needed for merge window (samples per beat) in notch suppression.
+    if len(x) >= 2:
+        dx = float(np.median(np.diff(x)))
+    else:
+        dx = 1.0
+    if not np.isfinite(dx) or dx <= 0:
+        dx = 1.0
+
+    # Prominence: ignore small bumps; 20% of 5–95% amplitude range.
+    amp = float(np.percentile(y_s, 95) - np.percentile(y_s, 5))
+    prom = 0.20 * amp
+    if not np.isfinite(prom) or prom <= 0:
+        prom = None
+
+    # find_peaks with distance (min_distance from caller function) and prominence.
+    peaks, _ = find_peaks(y_s, distance=min_distance, prominence=prom)
+    if len(peaks) == 0:
+        return None, None
+
+    # Notch merge: multiple peaks in one beat → keep only the tallest per window.
+    if len(peaks) >= 3:
+        median_pp = float(np.median(np.diff(x[peaks])))
+        merge_window_s = 0.45 * median_pp
+        merge_window_samples = max(1, int(merge_window_s / dx))
+    else:
+        merge_window_samples = min_distance
+    consolidated = []
+    i = 0
+    while i < len(peaks):
+        j = i
+        best = int(peaks[i])
+        while j + 1 < len(peaks) and (int(peaks[j + 1]) - int(peaks[j])) <= merge_window_samples:
+            j += 1
+            cand = int(peaks[j])
+            if y_s[cand] > y_s[best]:
+                best = cand
+        consolidated.append(best)
+        i = j + 1
+    peaks = np.array(consolidated, dtype=int)
+
+    # ED = minimum between consecutive systolic peaks.
+    trough_list = []
+    for i in range(len(peaks) - 1):
+        a, b = int(peaks[i]), int(peaks[i + 1])
+        if b > a + 1:
+            seg = y_s[a:b]
+            trough_list.append(a + int(np.argmin(seg)))
+    troughs = np.array(trough_list, dtype=int)
+    if len(troughs) == 0:
+        return None, None
+    return peaks, troughs
+
+
+def _sqi_template_correlation(y, peaks, troughs, template_len=200, min_corr=0.85):
+    """
+    SQI: cycle shape consistency via template correlation. Each beat is defined as
+    peak-to-peak (segment from peaks[i] to peaks[i+1]). Beats are resampled to a
+    fixed length, median template is built, and each beat is correlated to the template;
+    beats below min_corr are rejected. With one beat, template equals that beat (corr=1).
+
+    Returns:
+        good_peaks_mask (np.ndarray bool): length len(peaks); True = keep for metrics/plot.
+        good_troughs_mask (np.ndarray bool): length len(troughs); True = keep.
+    If SQI cannot be applied (e.g. too few points), returns all True (no filtering).
+    """
+    y = np.asarray(y, dtype=float)
+    peaks = np.asarray(peaks, dtype=int)
+    troughs = np.asarray(troughs, dtype=int)
+    n_peaks = len(peaks)
+    n_troughs = len(troughs)
+    # Expect one trough between each pair of consecutive peaks.
+    if n_peaks < 2 or n_troughs != n_peaks - 1:
+        return np.ones(n_peaks, dtype=bool), np.ones(n_troughs, dtype=bool)
+
+    n_beats = n_peaks - 1
+    # Resample each beat (peak[i] -> peak[i+1]) to template_len points.
+    resampled = np.zeros((n_beats, template_len))
+    for i in range(n_beats):
+        a, b = int(peaks[i]), int(peaks[i + 1])
+        if b <= a + 1:
+            resampled[i, :] = np.nan
+            continue
+        seg = y[a : b + 1]
+        x_old = np.linspace(0, 1, len(seg))
+        x_new = np.linspace(0, 1, template_len)
+        resampled[i, :] = np.interp(x_new, x_old, seg)
+
+    # Drop beats that are all NaN or constant (would break correlation).
+    valid = np.ones(n_beats, dtype=bool)
+    for i in range(n_beats):
+        r = resampled[i, :]
+        if np.any(np.isnan(r)) or np.std(r) < 1e-10:
+            valid[i] = False
+    if np.sum(valid) == 0:
+        return np.ones(n_peaks, dtype=bool), np.ones(n_troughs, dtype=bool)
+
+    # Median template (over valid beats only).
+    template = np.nanmedian(resampled[valid, :], axis=0)
+    if np.std(template) < 1e-10:
+        return np.ones(n_peaks, dtype=bool), np.ones(n_troughs, dtype=bool)
+
+    # Pearson correlation of each (valid) beat to template.
+    good_beat = np.zeros(n_beats, dtype=bool)
+    for i in range(n_beats):
+        if not valid[i]:
+            good_beat[i] = False
+            continue
+        r = resampled[i, :]
+        c = np.corrcoef(r, template)[0, 1]
+        good_beat[i] = c >= min_corr if np.isfinite(c) else False
+
+    # If all beats rejected, keep all (fallback: no filtering).
+    if not np.any(good_beat):
+        return np.ones(n_peaks, dtype=bool), np.ones(n_troughs, dtype=bool)
+
+    # Map beat quality to peak/trough masks. Peak i is in beat i-1 (start) and beat i (end); trough i is in beat i only.
+    good_peaks_mask = np.zeros(n_peaks, dtype=bool)
+    good_peaks_mask[0] = good_beat[0]
+    good_peaks_mask[-1] = good_beat[-1]
+    for i in range(1, n_peaks - 1):
+        good_peaks_mask[i] = good_beat[i - 1] or good_beat[i]
+    good_troughs_mask = good_beat.copy()
+    return good_peaks_mask, good_troughs_mask
+
+
 def plot_correction(Xplot, Yplot, df):
     """
     Adjusts and corrects the digitized waveform data using extracted text data, identifies
     and filters peaks and troughs, computes hemodynamic parameters, scales the time axis,
     and plots the corrected waveform.
 
-    The function works by first inserting a new column for digitized values in the DataFrame.
-    It processes the waveform to identify and filter peaks and troughs, computes key 
-    hemodynamic parameters (PS, ED, S/D, RI, TAmax, PI), and updates these values in the
-    DataFrame. It also scales the x-axis to real-time based on heart rate information and
-    generates a plot of the corrected waveform.
-
-    Exceptions are handled by printing traceback information.
+    Two-pass beat detection: first on arbitrary x (to get period for scaling), then after
+    time-scaling with HR the second pass uses time-based spacing. Metrics use the second
+    pass when available, else the first.
 
     Args:
         Xplot (list of float): The x-coordinates (time axis) of the waveform data.
@@ -1838,104 +2308,205 @@ def plot_correction(Xplot, Yplot, df):
     Returns:
         **df** (pandas.DataFrame): The DataFrame updated with computed parameters in the "Digitized Value" column.
     """
+    y = np.array(Yplot, dtype=float)
+    x = np.array(Xplot, dtype=float)
+    df.insert(loc=3, column="Digitized Value", value="")
+    peaks = np.array([], dtype=int)
+    troughs = np.array([], dtype=int)
+    peaks_for_metrics = np.array([], dtype=int)
+    troughs_for_metrics = np.array([], dtype=int)
+    arbitrary_period = 1.0
+    x_time = None
 
     try:
-        # import Jinja2
-        y = np.array(Yplot)
-        x = np.array(Xplot)
-        # DF = df
-        df.insert(loc=3, column="Digitized Value", value="")
-        peaks, _ = find_peaks(y)  # PSV
-        troughs, _ = find_peaks(-y)  # EDV
-        # filter out any anomalous signals:
-        trough_widths, _, _, _ = peak_widths(-y, troughs)
-        mean_widths_troughs = statistics.mean(trough_widths)
-        # filter out anomalous peaks
-        valid_troughs = []
-        for i in range(len(troughs)):
-            if trough_widths[i] > (mean_widths_troughs / 2):
-                valid_troughs.append(troughs[i])
-        troughs = valid_troughs
+        # First pass: beat detection on arbitrary x [0, 1]. Length-based min distance
+        # (assume at most ~15 beats in strip). Gives peaks/troughs and mean period for scaling.
+        # -------------------------------------------------------------------------
+        if len(y) >= 3 and len(x) == len(y):
+            min_distance_pass1 = max(1, len(x) // 15)
+            peaks_pass1, troughs_pass1 = _beat_detection_pass(x, y, min_distance_pass1)
+            if peaks_pass1 is not None and troughs_pass1 is not None:
+                peaks = peaks_pass1
+                troughs = troughs_pass1
+                if len(peaks) >= 2:
+                    arbitrary_period = float(x[peaks[-1]] - x[peaks[0]]) / max(1, len(peaks) - 1)
+                else:
+                    arbitrary_period = 1.0
 
-        results_half = peak_widths(y, peaks)
-        widths_of_peaks = results_half[0]
-        mean_widths_peaks = statistics.mean(widths_of_peaks)
-        valid_peaks = []
-        for i in range(len(peaks)):
-            if widths_of_peaks[i] > (mean_widths_peaks / 2) and y[peaks[i]] > (
-                    statistics.mean(y[peaks]) * 0.8
-            ):
-                valid_peaks.append(peaks[i])
-        peaks = valid_peaks
+        # -------------------------------------------------------------------------
+        # Time scaling: get HR from df and scale x -> x_time (seconds). If HR is
+        # missing or invalid we skip scaling and keep arbitrary x for plotting.
+        # -------------------------------------------------------------------------
+        try:
+            hr_vals = df.loc[df["Word"].str.contains("HR"), "Value"].values
+            hr = float(hr_vals[0]) if len(hr_vals) > 0 else 0.0
+            if np.isfinite(hr) and hr > 0.0:
+                real_period = 60.0 / hr
+                scale_factor = real_period / arbitrary_period
+                x_time = x * scale_factor
+            else:
+                x_time = x.copy()
+        except Exception:
+            x_time = x.copy()
 
-        # Peak systolic
-        PS = statistics.mean(y[peaks])
-        # End diastolic
-        ED = statistics.mean(y[troughs])
-        # Find S/D
-        SoverD = statistics.mean(y[peaks]) / statistics.mean(y[troughs])
-        # Find RI
-        RI = (
-                     statistics.mean(y[peaks]) - statistics.mean(y[troughs])
-             ) / statistics.mean(y[peaks])
-        # Find TAmax
-        TAmax = (statistics.mean(y[peaks]) + (2 * statistics.mean(y[troughs]))) / 3
-        # Find PI
-        PI = (
-                     statistics.mean(y[peaks]) - statistics.mean(y[troughs])
-             ) / statistics.mean(y)
+        # Second pass: beat detection on time-scaled x when available. Time-based min
+        # distance (200 bpm). If this succeeds we use these peaks/troughs; else keep first pass.
+        # -------------------------------------------------------------------------
+        if x_time is not None and len(x_time) == len(y) and np.any(x_time != x):
+            dx_s = float(np.median(np.diff(x_time))) if len(x_time) >= 2 else 1.0
+            if np.isfinite(dx_s) and dx_s > 0:
+                min_sep_s = 60.0 / 200.0
+                min_distance_pass2 = max(1, int(min_sep_s / dx_s))
+                peaks_pass2, troughs_pass2 = _beat_detection_pass(x_time, y, min_distance_pass2)
+                if peaks_pass2 is not None and troughs_pass2 is not None and len(peaks_pass2) > 0 and len(troughs_pass2) > 0:
+                    peaks = peaks_pass2
+                    troughs = troughs_pass2
 
-        words = ["PS", "ED", "S/D", "RI", "TA"]
-        values = [PS, ED, SoverD, RI, TAmax]
-        values = [round(elem, 2) for elem in values]
-        # Loop through each word and value
-        for i in range(len(words)):
-            word = words[i]
-            value = values[i]
-            try:
-                # Find rows where word is in "Text" column, and set corresponding "Value" to the value
-                df.loc[df["Word"].str.contains(word), "Digitized Value"] = value
+        # SQI: keep only beats that pass template-correlation filter. Metrics and plot
+        # use these peaks/troughs only.
+        # -------------------------------------------------------------------------
+        peaks_for_metrics = peaks
+        troughs_for_metrics = troughs
+        if len(peaks) > 0 and len(troughs) > 0:
+            good_peaks_mask, good_troughs_mask = _sqi_template_correlation(
+                y, peaks, troughs, template_len=200, min_corr=0.85
+            )
+            if np.any(good_peaks_mask) and np.any(good_troughs_mask):
+                peaks_for_metrics = peaks[good_peaks_mask]
+                troughs_for_metrics = troughs[good_troughs_mask]
 
-                # get_colour(df.loc[df["Word"].str.contains(word),'Value'].values[0],value)
-            except Exception:
-                continue
+        # Metrics from filtered peaks/troughs. Use original y; guard ED for S/D and RI.
+        # -------------------------------------------------------------------------
+        if len(peaks_for_metrics) > 0 and len(troughs_for_metrics) > 0:
+            PS = float(statistics.mean(y[peaks_for_metrics]))
+            ED = float(statistics.mean(y[troughs_for_metrics]))
+            if ED == 0:
+                ED = np.finfo(float).eps
+            SoverD = PS / ED
+            RI = (PS - ED) / PS if PS != 0 else 0.0
+            TAmax = (PS + 2 * ED) / 3.0
+            PI = (PS - ED) / float(np.mean(y)) if np.mean(y) != 0 else 0.0
+            words = ["PS", "ED", "S/D", "RI", "TA"]
+            values = [round(PS, 2), round(ED, 2), round(SoverD, 2), round(RI, 2), round(TAmax, 2)]
+            for i in range(len(words)):
+                try:
+                    df.loc[df["Word"].str.contains(words[i]), "Digitized Value"] = values[i]
+                except Exception:
+                    continue
 
-        # Period of the signal in arbitrary scale
-        arbitrary_period = (x[peaks[-1]] - x[peaks[1]]) / (len(peaks) - 2)
     except Exception:
-        traceback.print_exc()  # prints the error message and traceback
+        traceback.print_exc()
+        arbitrary_period = 1.0
 
+    # Plot digitization: usable beat markers only. Time-scaled x when HR valid;
+    # arbitrary x when HR invalid so markers are still drawn.
+    # -------------------------------------------------------------------------
     try:
-        # HR in bpm from extracted text
         hr_vals = df.loc[df["Word"].str.contains("HR"), "Value"].values
         hr = float(hr_vals[0]) if len(hr_vals) > 0 else 0.0
+        if np.isfinite(hr) and hr > 0.0:
+            real_period = 1.0 / (hr / 60.0)
+            scale_factor = real_period / arbitrary_period
+            x_plot = x * scale_factor
+            xlabel = "Time (s)"
+        else:
+            logger.warning("Invalid HR value for time scaling (%s); plotting on arbitrary x with beat markers.", hr)
+            x_plot = x
+            xlabel = "Arbitrary time scale"
 
-        # If HR is zero or invalid, skip time scaling 
-        if not np.isfinite(hr) or hr == 0.0:
-            logger.warning("Invalid HR value for time scaling (%s); skipping time scaling plot.", hr)
-            return df
-
-        # Period of the signal in real time scale from text extraction
-        real_period = 1.0 / (hr / 60.0)
-        # Calculate a scaling factor
-        scale_factor = real_period / arbitrary_period
-        x_time = x * scale_factor
         plt.close(2)
         plt.figure(2)
-        plt.plot(x_time, y)
-        plt.plot(x_time[peaks], y[peaks], "x")
-        plt.plot(x_time[troughs], y[troughs], "x")
-        # plt.plot(x_time[troughs[1:-1]],y[troughs[1:-1]],"x")
-        # Check if any value in x_time is NaN or zero
-        if not any(np.isnan(x) or x == 0 or np.isinf(x) for x in x_time):
-            plt.xlim((min(x_time), max(x_time)))
+        plt.plot(x_plot, y)
+        if len(peaks_for_metrics) > 0:
+            plt.plot(x_plot[peaks_for_metrics], y[peaks_for_metrics], "x", color="C0", markersize=8, label="PS")
+        if len(troughs_for_metrics) > 0:
+            plt.plot(x_plot[troughs_for_metrics], y[troughs_for_metrics], "x", color="C1", markersize=8, label="ED")
+        if not any(np.isnan(v) or v == 0 or np.isinf(v) for v in x_plot):
+            plt.xlim((min(x_plot), max(x_plot)))
         plt.ylim((0, max(y) + 10))
-        plt.xlabel("Time (s)")
+        plt.xlabel(xlabel)
         plt.ylabel("Flowrate (cm/s)")
     except Exception:
-        logger.warning("Could not plot time-scaled waveform; continuing.", exc_info=True)
+        logger.warning("Could not plot digitization waveform; continuing.", exc_info=True)
 
     return df
+
+
+def extract_dicom_label_text(cv2_img):
+    """
+    Extract vessel type (uterine/umbilical) and side (Rt/Lt) from yellow label text on the
+    left side of a DICOM Doppler image. Uses HSV yellow mask and OCR on top 2/3, left half.
+
+    Args:
+        cv2_img (np.ndarray): BGR or grayscale image from the DICOM (e.g. from extract_doppler_from_dicom).
+
+    Returns:
+        dict: {"vessel": "Uterine"|"Umbilical"|None, "side": "Rt"|"Lt"|None, "raw": str}
+    """
+    result = {"vessel": None, "side": None, "raw": ""}
+    if cv2_img is None or cv2_img.size == 0:
+        return result
+
+    img = np.asarray(cv2_img)
+    h, w = img.shape[0], img.shape[1]
+    # ROI: top 2/3 of height, left half of width (big yellow label lives there)
+    roi_top = int(h * 2 / 3)
+    roi_left = int(w / 2)
+
+    if img.ndim == 2:
+        gray = img
+        yellow_roi = gray[0:roi_top, 0:roi_left]
+    else:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        lower_yellow = np.array([1, 100, 100], dtype=np.uint8)
+        upper_yellow = np.array([200, 255, 255], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+        yellow_text = cv2.bitwise_and(gray, gray, mask=mask)
+        yellow_roi = yellow_text[0:roi_top, 0:roi_left]
+
+    try:
+        text = pytesseract.image_to_string(yellow_roi, lang="eng", config="--oem 1 --psm 6")
+    except Exception as e:
+        logger.warning("DICOM label OCR failed: %s", e)
+        return result
+
+    text = (text or "").strip()
+    result["raw"] = text
+    # Use only letters and spaces for matching (exclude numbers and symbols)
+    text_letters_only = re.sub(r"[^a-zA-Z\s]", " ", text)
+    text_letters_only = re.sub(r"\s+", " ", text_letters_only).strip()
+    text_lower = text_letters_only.lower()
+    # Normalise common OCR substitutions (1 for i, 0 for o)
+    text_normalised = text_lower.replace("1", "i").replace("0", "o")
+
+    # Vessel: exact substring and whole-word only.
+    # Do not use "art"/"artery" – they appear in both uterine and umbilical artery labels.
+    if "uterine" in text_lower or "uterine" in text_normalised:
+        result["vessel"] = "Uterine"
+    elif (
+        "umbilical" in text_lower
+        or "umbilica" in text_lower
+        or "umblical" in text_lower
+        or "umbilical" in text_normalised
+        or re.search(r"\bumb\b", text_lower)
+        or "bilical" in text_lower
+        or "bilical" in text_normalised
+    ):
+        result["vessel"] = "Umbilical"
+
+    # Side: exact word boundaries only
+    if re.search(r"\blt\b", text_lower) or " left" in text_lower or text_lower.startswith("left"):
+        result["side"] = "Lt"
+    elif re.search(r"\brt\b", text_lower) or " right" in text_lower or text_lower.startswith("right"):
+        result["side"] = "Rt"
+
+    # Print extracted text and what we matched
+    label_str = " ".join(filter(None, [result["side"], result["vessel"]])) or "(none)"
+    print("[DICOM label] Extracted text:", repr(text_letters_only or text))
+    print("[DICOM label] Matched to:", label_str)
+
+    return result
 
 
 def scan_type_test(input_image_filename):
@@ -2116,6 +2687,55 @@ def annotate(
             else:
                 pixel_data[x, y] = pixel_data[x, y]
     return img_RGB
+
+
+def annotate_dicom(input_image_obj, refined_segmentation_mask, dicom_metadata):
+    """
+    DICOM-only annotation: overlay waveform segmentation and waveform ROI box
+    on the Doppler image. No left/right axis ROIs or tick masks (DICOM has
+    physical axes from metadata). Returns the annotated image for saving.
+
+    Args:
+        input_image_obj (PIL.Image.Image): Doppler image (RGB or L); converted to RGBA internally.
+        refined_segmentation_mask (numpy.ndarray): Segmentation mask (1=waveform, same shape as image).
+        dicom_metadata (dict): Must contain RegionLocationMinX0, RegionLocationMaxX1,
+            RegionLocationMinY0, RegionLocationMaxY1 for the waveform box.
+
+    Returns:
+        PIL.Image.Image: Annotated image (RGBA) with waveform in red, ROI outline in green.
+    """
+    # Ensure we have a copy and RGBA so we can write (r,g,b,a) without errors
+    if input_image_obj.mode != "RGBA":
+        img = input_image_obj.convert("RGBA")
+    else:
+        img = input_image_obj.copy()
+
+    Xmin = int(dicom_metadata.get("RegionLocationMinX0", 0))
+    Xmax = int(dicom_metadata.get("RegionLocationMaxX1", 0))
+    Ymin = int(dicom_metadata.get("RegionLocationMinY0", 0))
+    Ymax = int(dicom_metadata.get("RegionLocationMaxY1", 0))
+
+    # Work on a copy of the mask so we don't mutate the caller's array
+    mask = np.asarray(refined_segmentation_mask, dtype=np.uint8).copy()
+    h, w = mask.shape
+
+    # Waveform ROI outline only (no left/right boxes)
+    r = [Xmin, Xmax, Xmax, Xmin, Xmin]
+    c = [Ymax, Ymax, Ymin, Ymin, Ymax]
+    rr, cc = polygon_perimeter(c, r, shape=mask.shape)
+    mask[rr, cc] = 2
+
+    pixel_data = img.load()
+    for y in range(img.size[1]):
+        for x in range(img.size[0]):
+            if y >= h or x >= w:
+                continue
+            if mask[y, x] == 1:
+                pixel_data[x, y] = (255, pixel_data[x, y][1], pixel_data[x, y][2], 250)
+            elif mask[y, x] == 2:
+                pixel_data[x, y] = (1, 255, 1, 255)
+            # else: leave pixel unchanged
+    return img
 
 
 def colour_extract(input_image_obj, TargetRGB, cyl_length, cyl_radius):

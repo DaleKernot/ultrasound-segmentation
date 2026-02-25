@@ -21,7 +21,19 @@ def check_file_for_us(file_path):
     Returns:
         A tuple of (patient_id, file_path) if the file is a likely ultrasound, or `None` otherwise.
     """
-    if file_path.lower().endswith(('.jpg', '.png')):
+    file_lower = file_path.lower()
+    
+    # Accept all DICOM files
+    if file_lower.endswith(('.dcm', '.dicom')):
+        # Extract patient ID from the file path
+        match = re.search(r"\d{4}", file_path)
+        if match:
+            patient_id = match.group(0)
+            return patient_id, file_path
+        return None
+    
+    # For JPG/PNG files, run scan_type_test
+    if file_lower.endswith(('.jpg', '.png')):
         try:
             Fail, df = general_functions.scan_type_test(file_path)
             if Fail == 0:
@@ -51,8 +63,8 @@ def get_likely_us(root_dir, pickle_path=None, use_parallel=True):
 
     # Check if the root_dir is a directory or a single file
     if os.path.isdir(root_dir):
-        # Collect all JPG and PNG files from the root directory
-        all_files = [os.path.join(subdir, file) for subdir, _, files in os.walk(root_dir) for file in files if file.endswith(('.JPG', '.jpg', '.PNG', '.png'))]
+        # Collect all JPG, PNG, and DICOM files from the root directory
+        all_files = [os.path.join(subdir, file) for subdir, _, files in os.walk(root_dir) for file in files if file.lower().endswith(('.jpg', '.png', '.dcm', '.dicom'))]
 
         if use_parallel:
             # Using ThreadPoolExecutor to parallelize the file processing
