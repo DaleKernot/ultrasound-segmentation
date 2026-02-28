@@ -37,11 +37,12 @@ def check_file_for_us(file_path):
         try:
             Fail, df = general_functions.scan_type_test(file_path)
             if Fail == 0:
-                # Extract patient ID from the file path
-                match = re.search(r"\d{4}", file_path)
-                if match:
-                    patient_id = match.group(0)
-                    return patient_id, file_path
+                # Use the image filename (without extension) as the patient ID
+                patient_id = os.path.splitext(os.path.basename(file_path))[0]
+                print(f"[DEBUG] usseg.check_file_for_us: JPG/PNG PASS (patient_id={patient_id})")
+                return patient_id, file_path
+            else:
+                print("[DEBUG] usseg.check_file_for_us: JPG/PNG FAIL (scan_type_test Fail==1)")
         except Exception:
             traceback.print_exc()
     return None
@@ -63,8 +64,14 @@ def get_likely_us(root_dir, pickle_path=None, use_parallel=True):
 
     # Check if the root_dir is a directory or a single file
     if os.path.isdir(root_dir):
-        # Collect all JPG, PNG, and DICOM files from the root directory
-        all_files = [os.path.join(subdir, file) for subdir, _, files in os.walk(root_dir) for file in files if file.lower().endswith(('.jpg', '.png', '.dcm', '.dicom'))]
+        # Collect all JPG, JPEG, PNG, and DICOM files from the root directory
+        all_files = [
+            os.path.join(subdir, file)
+            for subdir, _, files in os.walk(root_dir)
+            for file in files
+            if file.lower().endswith(('.jpg', '.jpeg', '.png', '.dcm', '.dicom'))
+        ]
+        print(f"[DEBUG] usseg.get_likely_us: found {len(all_files)} candidate files under {root_dir}")
 
         if use_parallel:
             # Using ThreadPoolExecutor to parallelize the file processing
@@ -74,6 +81,7 @@ def get_likely_us(root_dir, pickle_path=None, use_parallel=True):
             results = list(map(check_file_for_us, all_files))
 
         # Process results and populate patient_paths
+        kept = 0
         for res in results:
             if res:
                 patient_id, file_path = res
@@ -81,6 +89,8 @@ def get_likely_us(root_dir, pickle_path=None, use_parallel=True):
                     patient_paths[patient_id].append(file_path)
                 else:
                     patient_paths[patient_id] = [file_path]
+                kept += 1
+        print(f"[DEBUG] usseg.get_likely_us: kept {kept} files after filtering")
 
     elif os.path.isfile(root_dir):
         # If it's a single file, directly use the check_file_for_us function
