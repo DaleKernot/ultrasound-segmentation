@@ -2522,12 +2522,14 @@ def scan_type_test(input_image_filename):
 
     """
 
-    img = cv2.imread(input_image_filename)  # Input image file
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)  # Convert to grayscale
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)  # Convert to HSV
-    lower_yellow = np.array([1, 100, 100], dtype=np.uint8)  # Lower yellow bound
-    upper_yellow = np.array([200, 255, 255], dtype=np.uint8)  # Upper yellow bound
-    mask = cv2.inRange(hsv, lower_yellow, upper_yellow)  # Threshold HSV between bounds
+    img = cv2.imread(input_image_filename)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    lower_yellow = np.array([20, 40, 180], dtype=np.uint8)
+    upper_yellow = np.array([40, 255, 255], dtype=np.uint8)
+
+    mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
     yellow_text = cv2.bitwise_and(gray, gray, mask=mask)
 
     yellow_text[int(img.shape[1] * 0.45): img.shape[1], :] = 0  # Exclude bottom 3rd of image - target scans have no text of interest here.

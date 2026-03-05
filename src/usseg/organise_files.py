@@ -39,10 +39,16 @@ def check_file_for_us(file_path):
             if Fail == 0:
                 # Use the image filename (without extension) as the patient ID
                 patient_id = os.path.splitext(os.path.basename(file_path))[0]
-                print(f"[DEBUG] usseg.check_file_for_us: JPG/PNG PASS (patient_id={patient_id})")
+                print(
+                    "[DEBUG] usseg.check_file_for_us: JPG/PNG PASS "
+                    f"(file={file_path}, patient_id={patient_id})"
+                )
                 return patient_id, file_path
             else:
-                print("[DEBUG] usseg.check_file_for_us: JPG/PNG FAIL (scan_type_test Fail==1)")
+                print(
+                    "[DEBUG] usseg.check_file_for_us: JPG/PNG FAIL "
+                    f"(file={file_path}, reason=scan_type_test Fail==1)"
+                )
         except Exception:
             traceback.print_exc()
     return None
