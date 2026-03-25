@@ -318,7 +318,11 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
         try:
             try:  # Refine segmentation
                 (
-                    refined_segmentation_mask, top_curve_mask, top_curve_coords
+                    refined_segmentation_mask,
+                    top_curve_mask,
+                    top_curve_coords,
+                    ray_top_curve_mask,
+                    ray_top_curve_coords,
                 ) = general_functions.segment_refinement(
                     cv2_img, Xmin, Xmax, Ymin, Ymax, y_zero=y_zero
                 )
@@ -329,15 +333,36 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                 pass
 
             if us_image:
-                Xplot, Yplot, Ynought = general_functions.plot_digitized_data_single_axis(
-                    Rnumber, Rpositions, Lnumber, Lpositions, top_curve_coords,
+                (
+                    Xplot,
+                    Yplot,
+                    Ynought,
+                    Xplot_o,
+                    Yplot_o,
+                ) = general_functions.plot_digitized_data_single_axis(
+                    Rnumber,
+                    Rpositions,
+                    Lnumber,
+                    Lpositions,
+                    ray_top_curve_coords,
+                    overlay_curve_coords=top_curve_coords,
+                    overlay_is_ray=False,
                 )
             elif us_dicom:
-                Xplot, Yplot, Ynought = general_functions.plot_digitized_data_dicom(
-                    dicom_metadata, top_curve_coords=top_curve_coords,
+                (
+                    Xplot,
+                    Yplot,
+                    Ynought,
+                    Xplot_o,
+                    Yplot_o,
+                ) = general_functions.plot_digitized_data_dicom(
+                    dicom_metadata,
+                    top_curve_coords=ray_top_curve_coords,
+                    overlay_curve_coords=top_curve_coords,
+                    overlay_is_ray=False,
                 )
             else:
-                Xplot, Yplot, Ynought = [], [], []
+                Xplot, Yplot, Ynought, Xplot_o, Yplot_o = [], [], [], [], []
 
             # Annotation: image path uses axis masks and full annotate(), DICOM uses annotate_dicom() only.
             if us_image:
@@ -356,12 +381,16 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                     Waveform_dimensions=Waveform_dimensions,
                     Left_axis=ROIL,
                     Right_axis=ROIR,
+                    top_curve_coords=top_curve_coords,
+                    ray_top_curve_coords=ray_top_curve_coords,
                 )
             elif us_dicom:
                 col = general_functions.annotate_dicom(
                     input_image_obj=PIL_image,
                     refined_segmentation_mask=refined_segmentation_mask,
                     dicom_metadata=dicom_metadata,
+                    top_curve_coords=top_curve_coords,
+                    ray_top_curve_coords=ray_top_curve_coords,
                 )
             else:
                 col = None
@@ -383,24 +412,36 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
             # Metrics/correction: images use plot_correction (text df + digitized); DICOM uses waveform metrics only.
             if us_image:
                 try:
-                    df = general_functions.plot_correction(Xplot, Yplot, df)
+                    df = general_functions.plot_correction(
+                        Xplot,
+                        Yplot,
+                        df,
+                        Xplot_compare=Xplot_o,
+                        Yplot_compare=Yplot_o,
+                        compare_is_second_ray=False,
+                    )
                     Text_data.append(df)
                 except Exception:
                     traceback.print_exc()
                     logger.error("Failed correction")
                     continue
             elif us_dicom:
-                df = general_functions.waveform_metrics_from_digitized(Xplot, Yplot)
+                df = general_functions.waveform_metrics_from_digitized(
+                    Xplot,
+                    Yplot,
+                    Xplot_compare=Xplot_o,
+                    Yplot_compare=Yplot_o,
+                    compare_is_second_ray=False,
+                )
                 # Prepend label row (vessel + side) at top of table for HTML
                 if label_result and not df.empty:
                     label_str = " ".join(
                         filter(None, [label_result.get("side"), label_result.get("vessel")])
                     ).strip()
                     if label_str:
-                        label_row = pd.DataFrame(
-                            [{"Line": 0, "Word": "Label", "Value": label_str, "Unit": "", "Digitized Value": ""}],
-                            columns=df.columns,
-                        )
+                        row = {c: "" for c in df.columns}
+                        row.update({"Line": 0, "Word": "Label", "Value": label_str})
+                        label_row = pd.DataFrame([row], columns=df.columns)
                         df = pd.concat([label_row, df], ignore_index=True)
                     df["Line"] = range(1, len(df) + 1)
                 Text_data.append(df)
@@ -408,8 +449,10 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                 Text_data.append(None)
 
             Digitized_path = out_prefix + "_Digitized.png"
-            plt.figure(2)
-            plt.savefig(Digitized_path, dpi=900, bbox_inches="tight", pad_inches=0)
+            # Explicit figure 2 — after annotate(), current figure may be 1; HTML embeds this PNG.
+            plt.figure(2).savefig(
+                Digitized_path, dpi=900, bbox_inches="tight", pad_inches=0
+            )
             Digitized_scans.append(Digitized_path)
 
         except Exception:
