@@ -8,6 +8,11 @@ def generate_html(scans, annotated_scans, digitized_scans, tables):
     if len(scans) != len(tables):
         raise ValueError("The number of scan paths and data tables do not match.")
 
+    digitized_value_cols = (
+        "Digitized Value (ray)",
+        "Digitized Value (morph)",
+    )
+
     # Start building the HTML string
     html_str = '<html><head>'
     html_str += '<style>'
@@ -54,15 +59,23 @@ def generate_html(scans, annotated_scans, digitized_scans, tables):
         if table_data is not None:
             table_html = '<div style="display:inline-block;padding:10px;">'
             table_html += '<table border="1">'
-            max_widths = [0] * len(table_data.columns)
+            cols = list(table_data.columns)
+            max_widths = [len(str(c)) for c in cols]
             for _, row in table_data.iterrows():
                 for i, val in enumerate(row):
                     max_widths[i] = max(max_widths[i], len(str(val)))
+            table_html += '<tr>'
+            for i, name in enumerate(cols):
+                width = max_widths[i] + 10
+                table_html += f'<th style="width:{width}px">{name}</th>'
+            table_html += '</tr>'
+            for _, row in table_data.iterrows():
                 table_html += '<tr>'
                 for i, val in enumerate(row):
                     width = max_widths[i] + 10  # add some padding
                     try:
-                        if i == table_data.columns.get_loc('Digitized Value'):
+                        col_name = cols[i]
+                        if col_name in digitized_value_cols:
                             if val == '':
                                 cell_style = 'background-color: white'
                             else:
@@ -84,7 +97,7 @@ def generate_html(scans, annotated_scans, digitized_scans, tables):
                             cell_html = f'<td style="width:{width}px;{cell_style}">{val}</td>'
                         else:
                             cell_html = f'<td style="width:{width}px">{val}</td>'
-                    except:
+                    except Exception:
                         cell_html = f'<td style="width:{width}px">{val}</td>'
                     table_html += cell_html
                 table_html += '</tr>'
