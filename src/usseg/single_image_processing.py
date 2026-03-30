@@ -174,16 +174,32 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
             refined_segmentation_mask,
             top_curve_mask,
             top_curve_coords,
+            ray_top_curve_mask,
+            ray_top_curve_coords,
         ) = general_functions.segment_refinement(
             cv2_img, Xmin, Xmax, Ymin, Ymax, y_zero=y_zero
         )
-        Xplot, Yplot, Ynought = general_functions.plot_digitized_data_single_axis(
-            Rnumber, Rpositions, Lnumber, Lpositions, top_curve_coords,
+        Xplot, Yplot, Ynought, Xplot_o, Yplot_o = (
+            general_functions.plot_digitized_data_single_axis(
+                Rnumber,
+                Rpositions,
+                Lnumber,
+                Lpositions,
+                top_curve_coords,
+                overlay_curve_coords=ray_top_curve_coords,
+                overlay_is_ray=True,
+            )
         )
 
         if not text_extract_failed:
             try:
-                df = general_functions.plot_correction(Xplot, Yplot, df)
+                df = general_functions.plot_correction(
+                    Xplot_o,
+                    Yplot_o,
+                    df,
+                    Xplot_compare=Xplot,
+                    Yplot_compare=Yplot,
+                )
             except Exception:
                 logger.exception("Single-image: plot_correction failed")
 
@@ -206,23 +222,34 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
             refined_segmentation_mask,
             top_curve_mask,
             top_curve_coords,
+            ray_top_curve_mask,
+            ray_top_curve_coords,
         ) = general_functions.segment_refinement(
             cv2_img, Xmin, Xmax, Ymin, Ymax, y_zero=y_zero
         )
-        Xplot, Yplot, Ynought = general_functions.plot_digitized_data_dicom(
-            dicom_metadata, top_curve_coords=top_curve_coords
+        Xplot, Yplot, Ynought, Xplot_o, Yplot_o = (
+            general_functions.plot_digitized_data_dicom(
+                dicom_metadata,
+                top_curve_coords=top_curve_coords,
+                overlay_curve_coords=ray_top_curve_coords,
+                overlay_is_ray=True,
+            )
         )
-        df = general_functions.waveform_metrics_from_digitized(Xplot, Yplot)
+        df = general_functions.waveform_metrics_from_digitized(
+            Xplot_o,
+            Yplot_o,
+            Xplot_compare=Xplot,
+            Yplot_compare=Yplot,
+        )
 
         if label_result and not df.empty:
             label_str = " ".join(
                 filter(None, [label_result.get("side"), label_result.get("vessel")])
             ).strip()
             if label_str:
-                label_row = pd.DataFrame(
-                    [{"Line": 0, "Word": "Label", "Value": label_str, "Unit": "", "Digitized Value": ""}],
-                    columns=df.columns,
-                )
+                row = {c: "" for c in df.columns}
+                row.update({"Line": 0, "Word": "Label", "Value": label_str})
+                label_row = pd.DataFrame([row], columns=df.columns)
                 df = pd.concat([label_row, df], ignore_index=True)
             df["Line"] = range(1, len(df) + 1)
 
