@@ -418,7 +418,6 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                         df,
                         Xplot_compare=Xplot_o,
                         Yplot_compare=Yplot_o,
-                        compare_is_second_ray=False,
                     )
                     Text_data.append(df)
                 except Exception:
@@ -431,7 +430,6 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                     Yplot,
                     Xplot_compare=Xplot_o,
                     Yplot_compare=Yplot_o,
-                    compare_is_second_ray=False,
                 )
                 # Prepend label row (vessel + side) at top of table for HTML
                 if label_result and not df.empty:

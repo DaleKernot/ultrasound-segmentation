@@ -194,12 +194,11 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
         if not text_extract_failed:
             try:
                 df = general_functions.plot_correction(
-                    Xplot,
-                    Yplot,
+                    Xplot_o,
+                    Yplot_o,
                     df,
-                    Xplot_compare=Xplot_o,
-                    Yplot_compare=Yplot_o,
-                    compare_is_second_ray=True,
+                    Xplot_compare=Xplot,
+                    Yplot_compare=Yplot,
                 )
             except Exception:
                 logger.exception("Single-image: plot_correction failed")
@@ -237,11 +236,10 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
             )
         )
         df = general_functions.waveform_metrics_from_digitized(
-            Xplot,
-            Yplot,
-            Xplot_compare=Xplot_o,
-            Yplot_compare=Yplot_o,
-            compare_is_second_ray=True,
+            Xplot_o,
+            Yplot_o,
+            Xplot_compare=Xplot,
+            Yplot_compare=Yplot,
         )
 
         if label_result and not df.empty:
