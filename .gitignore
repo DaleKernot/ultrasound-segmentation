@@ -178,3 +178,6 @@ cython_debug/
 
 # VS Code
 .vscode/
+
+# Scratch / one-off test scripts (not for commit)
+scratch/

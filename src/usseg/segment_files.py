@@ -97,7 +97,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
         base_name = image_name.partition(".")[0]
         # Unique prefix so files with same basename (e.g. 001.dcm from different folders) don't overwrite
         out_prefix = output_dir + f"{idx}_{base_name}"
-        print(input_image_filename)
+        logger.info("Segmenting image file %s", input_image_filename)
 
         # Classify file type for downstream handling (image vs DICOM)
         ext = os.path.splitext(input_image_filename)[1].lower()
@@ -132,7 +132,6 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
 
                 # from General_functions import Colour_extract, Text_from_greyscale
                 COL = general_functions.colour_extract_vectorized(PIL_col, [255, 255, 100], 95, 95)
-                logger.info("Done Colour extract")
 
                 Fail, df = general_functions.text_from_greyscale(cv2_img, COL)
             except Exception:  # flat fail on 1
@@ -451,9 +450,9 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
         plt.close("all")
         i = 1
 
-    print(Digitized_scans)
-    print(Annotated_scans)
-    print(Text_data)
+    logger.info("Segmented digitized scans list %s", Digitized_scans)
+    logger.info("Segmented annotated scans list %s", Annotated_scans)
+    logger.info("Segmented text data tables list %s", Text_data)
     if pickle_path is not False:
         if pickle_path is None:
             pickle_path = toml.load("config.toml")["pickle"]["segmented_data"]

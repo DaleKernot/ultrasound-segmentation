@@ -1,0 +1,20 @@
+name: Deploy library
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build-and-release-package:
+    if: github.repository == 'SADIE-digital-environments/ultrasound-segmentation'
+    runs-on: ubuntu-24.04
+    name: Release package
+    permissions:
+      contents: write
+      id-token: write  # IMPORTANT: this permission is mandatory for trusted publishing
+    steps:
+      - name: Release Python package
+        uses: hsorby/release-python-package-action@v2
+        with:
+          pypi-package-name: usseg

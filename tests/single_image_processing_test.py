@@ -16,13 +16,13 @@ logger = logging.getLogger(__file__)
 
 def test_data_from_image():
     """Test the data_from_image function."""
-    img_path = "E:/us-data-anon/0000\IHE_PDI/00003511\AA13981B\AA196E50/00009020/EE277D8A.JPG"
+    img_path = "image_path"
 
-    PIL_image = Image.open(img_path)
-    cv2_image = np.array(PIL_image)
-    logger.info(f"Loaded image with shape {cv2_image.shape} and type {cv2_image.dtype}")
+    #PIL_image = Image.open(img_path)
+    #cv2_image = np.array(PIL_image)
+    #logger.info(f"Loaded image with shape {cv2_image.shape} and type {cv2_image.dtype}")
 
-    df, (xdata, ydata) = data_from_image(PIL_image, cv2_image)
+    df, (xdata, ydata) = data_from_image(image_path=img_path)
 
     # Makes sure that the lists aren't empty
     assert xdata

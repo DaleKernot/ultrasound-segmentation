@@ -10,7 +10,7 @@ name = "usseg"
 dynamic = ["version"]
 description = "Tools to segment doppler ultrasound signals from scan images."
 authors = [{name="Dale Kernot", email="874043@swansea.ac.uk"}]
-license = "GPL-3.0-or-later"
+license = "Apache-2.0"
 readme = "README.md"
 dependencies = [
     "rapidfuzz",
@@ -31,6 +31,9 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Medical Science Apps.",
 ]
+
+[project.urls]
+Repository = "https://github.com/SADIE-digital-environments/ultrasound-segmentation"
 
 [tool.setuptools_scm]
 version_scheme = "no-guess-dev"

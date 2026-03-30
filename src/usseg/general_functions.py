@@ -934,12 +934,12 @@ def search_for_labels(
             ROIAX = thresholded_image[
                     int(Left_dimensions[2]): int(Left_dimensions[3]),
                     int(Left_dimensions[0]): int(Left_dimensions[0] + TYLshift),
-                    ]  # Right ROI
+                    ]  # Left axis ROI
         elif Side == "Right":
             ROIAX = thresholded_image[
                     int(Right_dimensions[2]): int(Right_dimensions[3]),
                     int(Right_dimensions[0] + TYLshift): int(Right_dimensions[1]),
-                    ]  # Left ROI
+                    ]  # Right axis ROI
 
         extracted_text_data = pytesseract.image_to_data(
             ROIAX,
@@ -962,14 +962,13 @@ def search_for_labels(
         if retry == 0:
             break
 
-    # d = pytesseract.image_to_data(
-    #     ROIAX,
-    #     output_type=Output.DICT,
-    #     config="--psm 11 -c tessedit_char_whitelist=-0123456789",
-    # )
+    # Build label candidates: (text, box centre) pairs, dropping "" and "-" together
     n_boxes = len(extracted_text_data["level"])
-    CenBox = []  # Initialise variable to populate with box center coords
+    CenBox = []      # centres of boxes to keep
+    label_texts = [] # texts for boxes to keep
     for i in range(1, n_boxes):  # dont start from 0 as the first index is redundant
+        txt_val = extracted_text_data["text"][i]
+
         if Side == "Left":
             (x, y, wi, h) = (
                 extracted_text_data["left"][i],
@@ -985,25 +984,36 @@ def search_for_labels(
                 extracted_text_data["height"][i],
             )  # define (Xleft, Ytop, width, height) of each object from the dictionary
 
+        # De-duplicate Tesseract repeated rows
         o = i / 4  # we get 4 repeats for each real box, so this reduces that to 1.
-        if o.is_integer():
-            if Side == "Left":
-                CenBox.append(
-                    [
-                        (extracted_text_data["left"][i] + (extracted_text_data["width"][i] / 2)),
-                        (extracted_text_data["top"][i] + (extracted_text_data["height"][i] / 2)),
-                    ]
-                )  # calculate the center point of each bounding box
-            elif Side == "Right":
-                CenBox.append(
-                    [
-                        (extracted_text_data["left"][i] + TYLshift + (extracted_text_data["width"][i] / 2)),
-                        (extracted_text_data["top"][i] + (extracted_text_data["height"][i] / 2)),
-                    ]
-                )  # calculate the center point of each bounding box
+        if not o.is_integer():
+            continue
+
+        # Drop empty/standalone minus labels together with their boxes so that
+        # numbers and positions stay aligned.
+        if txt_val == "" or txt_val == "-":
+            continue
+
+        if Side == "Left":
+            CenBox.append(
+                [
+                    (extracted_text_data["left"][i] + (extracted_text_data["width"][i] / 2)),
+                    (extracted_text_data["top"][i] + (extracted_text_data["height"][i] / 2)),
+                ]
+            )  # calculate the center point of each bounding box
+        elif Side == "Right":
+            CenBox.append(
+                [
+                    (extracted_text_data["left"][i] + TYLshift + (extracted_text_data["width"][i] / 2)),
+                    (extracted_text_data["top"][i] + (extracted_text_data["height"][i] / 2)),
+                ]
+            )  # calculate the center point of each bounding box
+
+        label_texts.append(txt_val)
+
         cv2.rectangle(
             ROI3, (x, y), (x + wi, y + h), (255), 2
-        )  # Draw the rectangles on the ROI
+        )  # Draw the rectangles on the ROI for retained labels
 
     for i in range(0, len(CenBox)):
         dists = cdist([CenBox[i]], CenBox)
@@ -1152,10 +1162,9 @@ def search_for_labels(
         pattern = r'(-?\d+)-$'
         return re.sub(pattern, r'\1', s)
 
-    number = []
-    for i in range(len(extracted_text_data["text"])):
-        if extracted_text_data["text"][i] != "" and extracted_text_data["text"][i] != "-":
-            number.append(correct_number_format(extracted_text_data["text"][i]))
+    # Final numbers are derived directly from label_texts so they stay aligned
+    # with CenBox/positions.
+    number = [correct_number_format(s) for s in label_texts]
 
     empty_to_fill = np.zeros((image.shape[0], image.shape[1]))
 
@@ -1208,7 +1217,7 @@ def validate_axis_ticks(numbers, positions, side, spacing_tol=0.2):
             valid_numbers.append(float(v))
             valid_positions.append(list(p))
         except (ValueError, TypeError):
-            logger.warning(
+            logger.info(
                 "Axis validation for %s side: could not convert tick value '%s' to float; skipping this tick.",
                 side,
                 v,
@@ -1218,7 +1227,7 @@ def validate_axis_ticks(numbers, positions, side, spacing_tol=0.2):
     positions = valid_positions
 
     if len(numbers) < 2 or len(numbers) != len(positions):
-        logger.warning(
+        logger.info(
             "Axis validation failed for %s side: insufficient or mismatched ticks "
             "(%d values, %d positions).",
             side,
@@ -1292,7 +1301,7 @@ def validate_axis_ticks(numbers, positions, side, spacing_tol=0.2):
                         to_drop.add(j)
                 else:
                     # Conflicting labels at same y: drop the entire cluster.
-                    logger.warning(
+                    logger.info(
                         "Axis validation for %s side: conflicting tick values %s at shared y=%s; "
                         "dropping all ticks at this y.",
                         side,
@@ -1304,7 +1313,7 @@ def validate_axis_ticks(numbers, positions, side, spacing_tol=0.2):
 
             if to_drop:
                 for j in sorted(to_drop, reverse=True):
-                    logger.warning(
+                    logger.info(
                         "Axis validation for %s side: removing tick value %s at index %d (duplicate-y cleanup).",
                         side,
                         ordered_vals[j],
@@ -1378,7 +1387,7 @@ def validate_axis_ticks(numbers, positions, side, spacing_tol=0.2):
                 drop_idx = None
 
             if drop_idx is not None:
-                logger.warning(
+                logger.info(
                     "Axis validation for %s side: removing suspect endpoint tick value %s at index %d "
                     "for validation purposes (slopes=%s, cluster_rep=%0.3f)",
                     side,
@@ -1395,7 +1404,7 @@ def validate_axis_ticks(numbers, positions, side, spacing_tol=0.2):
         # If exactly two consecutive bad slopes, drop the interior tick between them
         if len(bad_indices) == 2 and bad_indices[1] == bad_indices[0] + 1:
             drop_idx = bad_indices[0] + 1  # index of the middle tick
-            logger.warning(
+            logger.info(
                 "Axis validation for %s side: removing suspect tick value %s at index %d "
                 "for validation purposes (slopes=%s, cluster_rep=%0.3f)",
                 side,
@@ -1435,7 +1444,7 @@ def validate_axis_ticks(numbers, positions, side, spacing_tol=0.2):
 
                 # Drop in descending index order so indices remain valid
                 for drop_idx in sorted({mid_tick, endpoint_tick}, reverse=True):
-                    logger.warning(
+                    logger.info(
                         "Axis validation for %s side: removing suspect tick value %s at index %d "
                         "(three-bad-slopes pattern, slopes=%s, cluster_rep=%0.3f)",
                         side,
@@ -1449,8 +1458,7 @@ def validate_axis_ticks(numbers, positions, side, spacing_tol=0.2):
                     idxs.pop(drop_idx)
                 continue
 
-        # If we reach here with remaining bad slopes, we can't safely decide which
-        # tick(s) to drop without risking over-aggressive correction.
+        # If bad slopes remain, we can't safely decide which tick(s) to drop.
         logger.warning(
             "Axis validation warning for %s side: inconsistent value-per-pixel slopes "
             "(cluster_rep=%0.3f, slopes=%s); unable to unambiguously identify bad ticks.",
@@ -2501,10 +2509,13 @@ def extract_dicom_label_text(cv2_img):
     elif re.search(r"\brt\b", text_lower) or " right" in text_lower or text_lower.startswith("right"):
         result["side"] = "Rt"
 
-    # Print extracted text and what we matched
+    # Log extracted text and what is matched for DICOM labels
     label_str = " ".join(filter(None, [result["side"], result["vessel"]])) or "(none)"
-    print("[DICOM label] Extracted text:", repr(text_letters_only or text))
-    print("[DICOM label] Matched to:", label_str)
+    logger.info(
+        "DICOM label OCR extracted text %s; matched label %s",
+        repr(text_letters_only or text),
+        label_str,
+    )
 
     return result
 
@@ -2904,6 +2915,15 @@ def text_from_greyscale(input_image_obj, COL):
     PIX = COL.load()
     img = input_image_obj
 
+    # Restrict text search to the right third of the image by zeroing
+    # everything left of 2/3 width. This is in addition to the existing
+    # vertical masking below.
+    width, height = COL.size
+    right_start = int(width * (2.0 / 3.0))
+    for y in range(height):
+        for x in range(right_start):
+            PIX[x, y] = (0, 0, 0)
+
     # 2. Apply slight Gaussian blur
     # smoothed_image = COL.filter(ImageFilter.GaussianBlur(radius=1)) # In some cases smoothing helps, in others it makes it worse?
 
@@ -2939,16 +2959,29 @@ def text_from_greyscale(input_image_obj, COL):
 
     def group_similar_numbers(y_center, tolerance, OCR_data):
         # This function groups indexes of words with similar y-coordinate center
-        # and also calculates the bounding box for each group of words
-        words = OCR_data["text"]
-        lefts = OCR_data["left"]
-        tops = OCR_data["top"]
-        widths = OCR_data["width"]
-        heights = OCR_data["height"]
+        # and also calculates the bounding box for each group of words.
+        #
+        # Empty / whitespace-only OCR entries are removed here so that they do
+        # not participate in line grouping or later matching.
+        valid_indices = [
+            i for i, t in enumerate(OCR_data["text"])
+            if t is not None and t != "" and t != " "
+        ]
+        if not valid_indices:
+            return [], []
+
+        words = [OCR_data["text"][i] for i in valid_indices]
+        lefts = [OCR_data["left"][i] for i in valid_indices]
+        tops = [OCR_data["top"][i] for i in valid_indices]
+        widths = [OCR_data["width"][i] for i in valid_indices]
+        heights = [OCR_data["height"][i] for i in valid_indices]
         x_centers = [left + width / 2 for left, width in zip(lefts, widths)]  # Calculate x_center for sorting
 
+        # Use the corresponding y_center entries for valid words only.
+        filtered_y_center = [y_center[i] for i in valid_indices]
+
         # Convert y_center to a numpy array and reshape for DBSCAN
-        data = np.array(y_center).reshape(-1, 1)
+        data = np.array(filtered_y_center).reshape(-1, 1)
 
         # Perform DBSCAN clustering on y-coordinates
         dbscan = DBSCAN(eps=tolerance, min_samples=2)
@@ -3116,21 +3149,138 @@ def text_from_greyscale(input_image_obj, COL):
         "DV-PLI",
         "DV-PVIV",
         "DV-HR",
+        "Lt MCA-PS",
+        "Lt MCA-ED",
+        "Lt MCA-S/D",
+        "Lt MCA-PI",
+        "Lt MCA-RI",
+        "Lt MCA-MD",
+        "Lt MCA-TAmax",
+        "Lt MCA-HR",
+        "Rt MCA-PS",
+        "Rt MCA-ED",
+        "Rt MCA-S/D",
+        "Rt MCA-PI",
+        "Rt MCA-RI",
+        "Rt MCA-MD",
+        "Rt MCA-TAmax",
+        "Rt MCA-HR",
     ]
 
     # Split text into lines
     lines = grouped_words  # text.split("\n")
+
+    def refine_hr_from_local_roi(df_in, lines_in, bboxes_in, col_img):
+        """Re-read HR from a local ROI around the first-pass HR line.
+
+        Uses first-pass matched HR line index -> line bounding box -> expanded ROI.
+        Then runs a lightweight deterministic OCR pass focused on HR text.
+        """
+        if df_in is None or df_in.empty or "Word" not in df_in.columns or "Line" not in df_in.columns:
+            return df_in
+
+        hr_rows = df_in.index[df_in["Word"].str.contains("HR", na=False)].tolist()
+        if not hr_rows:
+            return df_in
+
+        row_idx = hr_rows[0]
+        line_number = df_in.loc[row_idx, "Line"]
+        if pd.isna(line_number):
+            return df_in
+        line_idx = int(line_number) - 1
+        if line_idx < 0 or line_idx >= len(lines_in) or line_idx >= len(bboxes_in):
+            return df_in
+
+        box = bboxes_in[line_idx]
+        x1, y1 = box["top_left"]
+        x2, y2 = box["bottom_right"]
+        width = max(1, x2 - x1)
+        height = max(1, y2 - y1)
+
+        # Expand ROI around first-pass HR line and clamp to image bounds.
+        pad_x = max(15, int(0.35 * width))
+        pad_y = max(10, int(0.80 * height))
+        img_w, img_h = col_img.size
+        rx1 = max(0, x1 - pad_x)
+        ry1 = max(0, y1 - pad_y)
+        rx2 = min(img_w, x2 + pad_x)
+        ry2 = min(img_h, y2 + pad_y)
+        if rx2 <= rx1 or ry2 <= ry1:
+            return df_in
+
+        roi = col_img.crop((rx1, ry1, rx2, ry2))
+        roi_np = np.array(roi)
+        if roi_np.size == 0:
+            return df_in
+
+        # Lightweight deterministic enhancement.
+        if roi_np.ndim == 3:
+            gray = cv2.cvtColor(roi_np, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = roi_np
+        gray = cv2.equalizeHist(gray)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        up = cv2.resize(thr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+
+        # Restrict extraction to HR-like tokens/lines.
+        txt = pytesseract.image_to_string(
+            up, lang="eng", config="--oem 1 --psm 7 -c tessedit_char_whitelist=HRhr0123456789./- bpmBPM"
+        )
+        txt_norm = re.sub(r"\s+", " ", (txt or "").strip())
+        if "HR" not in txt_norm.upper():
+            txt2 = pytesseract.image_to_string(
+                up, lang="eng", config="--oem 1 --psm 6 -c tessedit_char_whitelist=HRhr0123456789./- bpmBPM"
+            )
+            txt2_norm = re.sub(r"\s+", " ", (txt2 or "").strip())
+            if "HR" in txt2_norm.upper():
+                txt_norm = txt2_norm
+            else:
+                return df_in
+
+        # Parse HR value from local ROI text.
+        matches = re.findall(r"(\d{2,3}(?:\.\d+)?)", txt_norm)
+        if not matches:
+            return df_in
+        refined_candidates = [float(m) for m in matches]
+        refined_candidates = [v for v in refined_candidates if 20 <= v <= 240]
+        if not refined_candidates:
+            return df_in
+        hr_refined = refined_candidates[0]
+
+        current_val = df_in.loc[row_idx, "Value"] if "Value" in df_in.columns else None
+
+        def _hr_implausible(v):
+            return v is None or pd.isna(v) or (not np.isfinite(float(v))) or float(v) < 20 or float(v) > 240
+
+        if _hr_implausible(current_val):
+            df_in.loc[row_idx, "Value"] = round(hr_refined, 2)
+            if "Unit" in df_in.columns and (pd.isna(df_in.loc[row_idx, "Unit"]) or df_in.loc[row_idx, "Unit"] in ("", 0)):
+                df_in.loc[row_idx, "Unit"] = "bpm"
+            logger.warning(
+                "hr_refine: replaced implausible/missing first-pass HR with local ROI OCR value %s",
+                round(hr_refined, 2),
+            )
+        else:
+            current_val_f = float(current_val)
+            if abs(current_val_f - hr_refined) > 3:
+                logger.warning(
+                    "hr_refine: first-pass HR (%s) disagrees with local ROI OCR (%s); keeping first-pass value",
+                    round(current_val_f, 2),
+                    round(hr_refined, 2),
+                )
+        return df_in
     # Initialize DataFrame
     df = pd.DataFrame(columns=["Line", "Word", "Value", "Unit"])
 
-    prefixes = ["Lt", "Rt", "Umb", "DV"]
+    prefixes = ["Lt Ut", "Rt Ut", "Umb", "DV","Rt MCA","Lt MCA"]
     prefix_counts = {prefix: sum(1 for line in lines if prefix in line) for prefix in prefixes}
     most_likely_prefix = max(prefix_counts, key=prefix_counts.get)
 
     # Filter target words based on the most likely prefix
     target_words = [word for word in target_words if word.startswith(most_likely_prefix)]
     word_order = [word for word in target_words if word.startswith(most_likely_prefix)]
-    target_word_mem = target_words.copy()
+
     # Step 1: Exact matching
     matched_lines = set()  # to store the indices of lines that have been matched
 
@@ -3185,12 +3335,24 @@ def text_from_greyscale(input_image_obj, COL):
                     matched_lines.add(i)
                     break  # Exit the inner loop once a match is found
 
+    # If no line matched any target word exactly (distance == 0), flag it – this
+    # is a strong indicator that the prefix matching is off for this scan.
+    if not matched_lines:
+        logger.warning(
+            "Metric OCR: no exact prefix matches between OCR lines and target words; "
+            "metric labels may be misaligned."
+        )
+
     def find_closest_target(line, target_words):
         min_distance = float('inf')
         closest_word = None
 
         for word in target_words:
-            distance = Levenshtein.distance(line, word)
+            # Compare only the prefix of the line up to the target word length,
+            # so trailing numbers/units (e.g. " — 27.35cm/s") do not affect
+            # the distance. Case and characters are preserved.
+            candidate = line[: len(word)]
+            distance = Levenshtein.distance(candidate, word)
             if distance < min_distance:
                 min_distance = distance
                 closest_word = word
@@ -3200,6 +3362,7 @@ def text_from_greyscale(input_image_obj, COL):
     # Set a threshold for acceptable similarity
     threshold = 7
 
+    # Step 3: Closest target word matching for unmatched lines
     for i, line in enumerate(lines):
         if i not in matched_lines:  # only process unmatched lines
             closest_word, distance = find_closest_target(line, target_words)
@@ -3213,6 +3376,8 @@ def text_from_greyscale(input_image_obj, COL):
                     df.loc[len(df)] = {"Line": i + 1, "Word": closest_word, "Value": value, "Unit": unit}
                     target_words.remove(closest_word)
                 matched_lines.add(i)
+
+
 
     target_words_extended = [
         "Lt Ut-PS cm/s",
@@ -3328,7 +3493,7 @@ def text_from_greyscale(input_image_obj, COL):
                 temp = df.loc[df['Word'] == 'DV-S/a', 'Value'].values[0]
                 df.loc[df['Word'] == 'DV-S/a', 'Value'] = df.loc[df['Word'] == 'DV-S', 'Value'].values[0]
                 df.loc[df['Word'] == 'DV-S', 'Value'] = temp
-                print("swapped DV-S/a and DV-S")
+                logger.info("Metric DV: swapped DV-S/a and DV-S values")
 
             if df.loc[df['Word'] == 'DV-a/S', 'Unit'].values[0] != '' and df.loc[df['Word'] == 'DV-a', 'Unit'].values[0] == '':
                 # Storing temporary values for swapping
@@ -3342,8 +3507,13 @@ def text_from_greyscale(input_image_obj, COL):
             df = metric_check_dv(df)  # handle the ductus venousus differently
         else:
             df = metric_check(df)  # for left, right, and umbilical
-    except:
-        print("metric check failed")
+    except Exception:
+        logger.exception("Metric check failed for uterine/umbilical metrics")
+
+    try:
+        df = refine_hr_from_local_roi(df, lines, bounding_boxes, COL)
+    except Exception:
+        logger.exception("hr_refine: local HR refinement failed")
 
     # Enforce positive heart-rate values: OCR occasionally hallucinates a leading '-'
     if not df.empty and 'Value' in df.columns and 'Word' in df.columns:
@@ -3371,43 +3541,69 @@ def metric_check(df):
         - df (DataFrame): DataFrame with corrected values after metric checking calculations
     """
 
+    # Preserve raw, pre-correction metric values in a separate column so that
+    # the main "Value" field can be corrected without losing the originals.
+    if "Raw Value" not in df.columns:
+        df["Raw Value"] = df["Value"]
+
     def identify_prefix(lines):
-        # Try to identify the prefix in use
-        for prefix in ["Lt", "Rt", "Umb"]:
-            if lines['Word'].str.contains(prefix).any():
-                print("prefix found")
-                PRF = prefix
+        # Keep this list aligned with the OCR metric labels used in text extraction.
+        target_words = [
+            "Lt Ut-PS",
+            "Lt Ut-ED",
+            "Lt Ut-S/D",
+            "Lt Ut-PI",
+            "Lt Ut-RI",
+            "Lt Ut-MD",
+            "Lt Ut-TAmax",
+            "Lt Ut-HR",
+            "Rt Ut-PS",
+            "Rt Ut-ED",
+            "Rt Ut-S/D",
+            "Rt Ut-PI",
+            "Rt Ut-RI",
+            "Rt Ut-MD",
+            "Rt Ut-TAmax",
+            "Rt Ut-HR",
+            "Umb-PS",
+            "Umb-ED",
+            "Umb-S/D",
+            "Umb-PI",
+            "Umb-RI",
+            "Umb-MD",
+            "Umb-TAmax",
+            "Umb-HR",
+            "Lt MCA-PS",
+            "Lt MCA-ED",
+            "Lt MCA-S/D",
+            "Lt MCA-PI",
+            "Lt MCA-RI",
+            "Lt MCA-MD",
+            "Lt MCA-TAmax",
+            "Lt MCA-HR",
+            "Rt MCA-PS",
+            "Rt MCA-ED",
+            "Rt MCA-S/D",
+            "Rt MCA-PI",
+            "Rt MCA-RI",
+            "Rt MCA-MD",
+            "Rt MCA-TAmax",
+            "Rt MCA-HR",
+        ]
+        valid_prefixes = ["Lt Ut", "Rt Ut", "Umb", "Lt MCA", "Rt MCA"]
+        prf = None
+        for prefix in valid_prefixes:
+            if lines["Word"].str.contains(prefix, regex=False).any():
+                prf = prefix
+                break
 
-            target_words = [
-                "Lt Ut-PS",
-                "Lt Ut-ED",
-                "Lt Ut-S/D",
-                "Lt Ut-PI",
-                "Lt Ut-RI",
-                "Lt Ut-MD",
-                "Lt Ut-TAmax",
-                "Lt Ut-HR",
-                "Rt Ut-PS",
-                "Rt Ut-ED",
-                "Rt Ut-S/D",
-                "Rt Ut-PI",
-                "Rt Ut-RI",
-                "Rt Ut-MD",
-                "Rt Ut-TAmax",
-                "Rt Ut-HR",
-                "Umb-PS",
-                "Umb-ED",
-                "Umb-S/D",
-                "Umb-PI",
-                "Umb-RI",
-                "Umb-MD",
-                "Umb-TAmax",
-                "Umb-HR",
-            ]
-        # Splitting the target words based on prefixes
-        target_words = [word for word in target_words if word.startswith(PRF)]
+        if prf is None:
+            logger.warning("metric_check: metric prefix could not be detected; keeping extracted rows as-is")
+            return None, []
 
-        return PRF, target_words  # Return None if no known prefix is found
+        logger.info("metric_check: metric prefix detected %s", prf)
+        filtered_target_words = [word for word in target_words if word.startswith(prf)]
+        return prf, filtered_target_words
 
     def add_missing_rows(df_in):
         # Identify the Prefix
@@ -3425,7 +3621,7 @@ def metric_check(df):
 
     #df = add_missing_rows(df)
 
-    def check_TAmax_value(value_in, df_in):  # Decimal can be misread, so common sense check.
+    def normalize_tamax_sign(value_in, df_in):  # Flip TAmax sign only when TAmax is negative but MD, PS, and ED are all positive.
 
         MD = df_in.loc[df['Word'].str.contains('MD'), 'Value'].values[0] if df_in['Word'].str.contains('MD').any() else 0
         PS = df_in.loc[df['Word'].str.contains('PS'), 'Value'].values[0] if df_in['Word'].str.contains('PS').any() else 0
@@ -3441,14 +3637,14 @@ def metric_check(df):
     PI = df.loc[df['Word'].str.contains('PI'), 'Value'].values[0] if df['Word'].str.contains('PI').any() else 0
     df.loc[df['Word'].str.contains('PI'), 'Value'] = check_pi_value(PI)
     TAmax = df.loc[df['Word'].str.contains('TAmax'), 'Value'].values[0] if df['Word'].str.contains('TAmax').any() else 0
-    df.loc[df['Word'].str.contains('TAmax'), 'Value'] = check_TAmax_value(TAmax, df)
+    df.loc[df['Word'].str.contains('TAmax'), 'Value'] = normalize_tamax_sign(TAmax, df)
 
     # Peak systolic
     PS = df.loc[df['Word'].str.contains('PS'), 'Value'].values[0] if df['Word'].str.contains('PS').any() else 0
     # End diastolic
     ED = df.loc[df['Word'].str.contains('ED'), 'Value'].values[0] if df['Word'].str.contains('ED').any() else 0
 
-    def check_TAmax_value(PS, ED, df):  # Decimal can be misread, so common sense check.
+    def normalize_ps_ed_values(PS, ED, df):  # Decimal can be misread, so common sense check.
 
         TAmax = df.loc[df['Word'].str.contains('TAmax'), 'Value'].values[0] if df['Word'].str.contains('TAmax').any() else 0
         MD = df.loc[df['Word'].str.contains('MD'), 'Value'].values[0] if df['Word'].str.contains('MD').any() else 0
@@ -3481,7 +3677,7 @@ def metric_check(df):
 
         return PSnew, EDnew
 
-    PS, ED = check_TAmax_value(PS, ED, df)  # sense check for pressures
+    PS, ED = normalize_ps_ed_values(PS, ED, df)  # sense check for pressures
     df.loc[df['Word'].str.contains('PS'), 'Value'] = PS
     df.loc[df['Word'].str.contains('ED'), 'Value'] = ED
 
@@ -3490,7 +3686,7 @@ def metric_check(df):
     # Find RI
     RI_calc = (PS - ED) / PS
     # Find TAmax
-    TAmax_calc = (PS + (2 * ED)) / 3
+    TAmax_calc = (PS + (2 * ED)) / 3 # Approximaton of TAmax, to be used as a fallback.
 
     # Now check whether the PS & ED dependant metrics are consistent between calculated and extracted:
     # Extracted values with default as None if not present
@@ -3527,26 +3723,28 @@ def metric_check(df):
 
     def Metric_comparison(c_df, col):
 
-        # Tolerance level (you can adjust this based on your requirements)
-        tolerance1 = 0.2
-        tolerance2 = 4  # This tolerance is larger because the equation we used for TAmax is approximate
+        # Tolerance level for metrics directly derived from PS and ED
+        tolerance1 = 0.5
         conditions_met = []
         for parameter, extracted_name in [('SoverD', 'SoverD_extracted'), ('RI', 'RI_extracted'), ('TAmax', 'TAmax_extracted')]:
             extracted_value = c_df['Extracted'][extracted_name]
 
             if extracted_value is not None:
+                if parameter == 'TAmax':
+                    ps_val = c_df['Extracted']['PS_extracted']
+                    ed_val = c_df['Extracted']['ED_extracted']
+                    if ps_val is not None and ed_val is not None and abs(ed_val) < abs(extracted_value) < abs(ps_val):
+                        conditions_met.append('TAmax_bounds')
+                    continue
                 for row_name, calc_value in c_df.iloc[:, col].items():
                     if str(row_name).startswith(extracted_name[:-9]):  # If row name starts with the parameter name
-                        tolerance = tolerance1 if parameter != 'TAmax' else tolerance2
-                        if abs(calc_value - extracted_value) < tolerance:
+                        if abs(calc_value - extracted_value) < tolerance1:
                             conditions_met.append(row_name)
                             break  # Exit the inner loop once a match is found
 
         return conditions_met
 
     conditions_met = Metric_comparison(comparison_dataframe, 1)
-
-    # You've already extracted PS, SoverD_extracted, RI_extracted, and TAmax_extracted
 
     # Check if all 3 metrics are inconsistent
     if len(conditions_met) == 0:  # All 3 are not consistent
@@ -3607,7 +3805,7 @@ def metric_check(df):
                     desired_row_name = parts[1] + '_from_' + parts[2]
                     new_value = comparison_dataframe.loc[desired_row_name, 'Third_calc']
                     # We have calculated the new PS!
-                    print(f"Recalculated PS (from RI): {new_value}")
+                    logger.info("Metric OCR: recalculated PS from RI as %s", new_value)
                     df.loc[df['Word'].str.contains('PS'), 'Value'] = round(new_value, 2)
                     PS = df.loc[df['Word'].str.contains('PS'), 'Value'].values[0]
                     ED = df.loc[df['Word'].str.contains('ED'), 'Value'].values[0]
@@ -3626,7 +3824,7 @@ def metric_check(df):
                 desired_row_name = parts[1] + '_from_' + parts[2]
                 new_value = comparison_dataframe.loc[desired_row_name, 'Second_calc']
                 # We have calculated the new PS!
-                print(f"Recalculated PS (from RI): {new_value}")
+                logger.info("Metric OCR: recalculated ED from RI as %s", new_value)
                 df.loc[df['Word'].str.contains('ED'), 'Value'] = round(new_value, 2)
                 PS = df.loc[df['Word'].str.contains('PS'), 'Value'].values[0]
                 ED = df.loc[df['Word'].str.contains('ED'), 'Value'].values[0]
@@ -3637,13 +3835,12 @@ def metric_check(df):
                 # Find TAmax
                 df.loc[df['Word'].str.contains('TAmax'), 'Value'] = round((PS + (2 * ED)) / 3, 2)
 
-
         except ZeroDivisionError:
-            print("Error: Division by zero encountered. Check the extracted values.")
+            logger.error("Metric OCR: division by zero encountered while checking uterine/umbilical metrics")
     elif len(conditions_met) < 3:
         # At least 1 of the metrics is consistent, therefore PS and ED can be assumed to be correct,
-        # Caclulate the inconsistent metrics from the PS and ED calculations
-        print("At least one text extraction error, correcting...")
+        # Calculate the inconsistent metrics from the PS and ED calculations
+        logger.warning("Metric OCR: at least one text extraction error, correcting uterine/umbilical metrics")
 
         if 'SoverD' not in conditions_met:
             # Find S/D
@@ -3655,7 +3852,7 @@ def metric_check(df):
             # Find TAmax
             df.loc[df['Word'].str.contains('TAmax'), 'Value'] = round((PS + (2 * ED)) / 3, 2)
     else:
-        print("All metrics are consistent.")
+        logger.info("Metric OCR: all uterine/umbilical metrics are self-consistent")
 
     return df
 
@@ -3746,6 +3943,11 @@ def metric_check_dv(df):
         df(DataFrame): DataFrame with corrected values after metric checking calculations
     """
 
+    # Preserve raw, pre-correction DV metric values in a separate column so
+    # that the main "Value" field can be corrected without losing originals.
+    if "Raw Value" not in df.columns:
+        df["Raw Value"] = df["Value"]
+
     # Splitting the target words based on prefixes
     def add_missing_rows(df):
         # Identify the Prefix
@@ -3773,7 +3975,7 @@ def metric_check_dv(df):
 
     df = add_missing_rows(df)
 
-    def check_TAmax_value(value, df):  # Decimal can be misread, so common sense check.
+    def normalize_tamax_sign(value, df):  # Flip DV-TAmax sign only when TAmax is negative but DV-S/a, DV-S, and DV-D are all positive.
 
         PLI = df.loc[df['Word'] == 'DV-S/a', 'Value'].values[0]
         PS = df.loc[df['Word'] == 'DV-S', 'Value'].values[0]
@@ -3789,14 +3991,14 @@ def metric_check_dv(df):
     PI = df.loc[df['Word'] == 'DV-PI', 'Value'].values[0]
     df.loc[df['Word'] == 'DV-PI', 'Value'] = check_pi_value(PI)
     TAmax = df.loc[df['Word'] == 'DV-TAmax', 'Value'].values[0]
-    df.loc[df['Word'] == 'DV-TAmax', 'Value'] = check_TAmax_value(TAmax, df)
+    df.loc[df['Word'] == 'DV-TAmax', 'Value'] = normalize_tamax_sign(TAmax, df)
 
     # Peak systolic
     PS = df.loc[df['Word'] == 'DV-S', 'Value'].values[0]
     # End diastolic
     ED = df.loc[df['Word'] == 'DV-D', 'Value'].values[0]
 
-    def check_TAmax_value(PS, ED, df):  # Decimal can be misread, so common sense check.
+    def normalize_ps_ed_values(PS, ED, df):  # Decimal can be misread, so common sense check.
 
         TAmax = df.loc[df['Word'] == 'DV-TAmax', 'Value'].values[0]
         a = df.loc[df['Word'] == 'DV-a', 'Value'].values[0]
@@ -3811,7 +4013,7 @@ def metric_check_dv(df):
 
         return PS, ED
 
-    PS, ED = check_TAmax_value(PS, ED, df)  # sense check for pressures
+    PS, ED = normalize_ps_ed_values(PS, ED, df)  # sense check for pressures
 
     def check_S_D_value(value):  # Decimal can be misread, so common sense check.
         # If the value is between 0 and 2, return it as is
@@ -3898,10 +4100,10 @@ def metric_check_dv(df):
 
     try:
         conditions_met = metric_comparison(comparison_dataframe, 1)
-        print("ok")
-    except:
+        logger.info("Metric OCR: metric comparison completed successfully")
+    except Exception:
         conditions_met = None
-        traceback.print_exc()
+        logger.exception("Metric OCR: metric comparison failed")
 
     # You've already extracted PS, Sovera_extracted, RI_extracted, and TAmax_extracted
 
@@ -3963,7 +4165,7 @@ def metric_check_dv(df):
                     desired_row_name = parts[1] + '_from_' + parts[2]
                     new_value = comparison_dataframe.loc[desired_row_name, 'Third_calc']
                     # We have calculated the new PS!
-                    print(f"Recalculated PS (from PI): {new_value}")
+                    logger.info("Metric OCR DV: recalculated PS from PI as %s", new_value)
                     df.loc[df['Word'] == 'DV-S', 'Value'] = new_value
                     PS = df.loc[df['Word'] == 'DV-S', 'Value'].values[0]
                     a = df.loc[df['Word'] == 'DV-a', 'Value'].values[0]
@@ -3982,7 +4184,7 @@ def metric_check_dv(df):
                 desired_row_name = parts[1] + '_from_' + parts[2]
                 new_value = comparison_dataframe.loc[desired_row_name, 'Second_calc']
                 # We have calculated the new PS!
-                print(f"Recalculated PS (from PI): {new_value}")
+                logger.info("Metric OCR DV: recalculated a from PI as %s", new_value)
                 df.loc[df['Word'] == 'DV-a', 'Value'] = round(new_value, 2)
                 PS = df.loc[df['Word'] == 'DV-S', 'Value'].values[0]
                 a = df.loc[df['Word'] == 'DV-a', 'Value'].values[0]
@@ -3994,11 +4196,11 @@ def metric_check_dv(df):
                 df.loc[df['Word'] == 'DV-TAmax', 'Value'] = round((PS + (2 * a)) / 3, 2)
 
         except ZeroDivisionError:
-            print("Error: Division by zero encountered. Check the extracted values.")
+            logger.error("Metric OCR DV: division by zero encountered while checking DV metrics")
     elif len(conditions_met) < 3:
         # At least 1 of the metrics is consistent, therefore PS and a can be assumed to be correct,
         # Calculate the inconsistent metrics from the PS and a calculations
-        print("At least one text extraction error, correcting...")
+        logger.warning("Metric OCR DV: at least one text extraction error, correcting DV metrics")
 
         if 'Sovera' not in conditions_met:
             # Find S/a
@@ -4011,6 +4213,6 @@ def metric_check_dv(df):
             # Find TAmax
             df.loc[df['Word'] == 'DV-TAmax', 'Value'] = round((PS + (2 * a)) / 3, 2)
     else:
-        print("All metrics are consistent.")
+        logger.info("Metric OCR DV: all DV metrics are self-consistent")
 
     return df

@@ -65,9 +65,12 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
 
     # Guard invalid input combinations
     if image_path is not None and (pil_img is not None or cv2_img is not None):
-        raise ValueError(
-            "Provide either image_path OR (pil_img AND cv2_img), not both."
+        msg = (
+            "Do not pass image_path together with pil_img or cv2_img; "
+            "use image_path alone, or pass both pil_img and cv2_img."
         )
+        logger.error("Single-image data_from_image: %s", msg)
+        raise ValueError(msg)
 
 
     if image_path is not None:
@@ -83,15 +86,17 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
             dicom_metadata = general_functions.extract_dicom_metadata(image_path)
             PIL_image, cv2_img = general_functions.extract_doppler_from_dicom(image_path)
         else:
-            raise ValueError(f"Unsupported file type: {ext}")
+            msg = f"Unsupported file type: {ext!r}"
+            logger.error("Single-image data_from_image: %s", msg)
+            raise ValueError(msg)
     else:
         # Guard invalid input combinations and allow legacy inputs
         if pil_img is not None and cv2_img is not None:
                 us_image = True
         else:
-            raise ValueError(
-                "Provide either image_path OR (pil_img AND cv2_img), not both."
-                )
+            msg = "Provide image_path, or both pil_img and cv2_img."
+            logger.error("Single-image data_from_image: %s", msg)
+            raise ValueError(msg)
 
     # Downstream pipeline aligned with segment_files: branch on us_image vs us_dicom
     if us_image:
@@ -101,8 +106,6 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
         text_extract_failed, df = general_functions.text_from_greyscale(cv2_img, COL)
         if text_extract_failed:
             logger.warning("Couldn't extract text from image. Continuing...")
-        else:
-            logger.info("Completed colour extraction.")
 
         # No error handling for initial segmentation as impossible to complete segmentation
         # without segmentation mask.
@@ -163,8 +166,6 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
                 left_numbers=Lnumber, left_positions=Lpositions,
                 right_numbers=Rnumber, right_positions=Rpositions,
             )
-            if y_zero is not None:
-                logger.info(f"Single-image: estimated y=0 line at y={y_zero:.2f}")
         except Exception:
             logger.exception("Single-image: zero-line estimation failed")
             y_zero = None
@@ -229,4 +230,6 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
         return df, [Xplot, Yplot]
 
     else:
-        raise ValueError("Unsupported file type.")
+        msg = f"Unsupported file type (us_image={us_image}, us_dicom={us_dicom})."
+        logger.error("Single-image data_from_image: %s", msg)
+        raise ValueError(msg)

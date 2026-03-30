@@ -65,12 +65,22 @@ def generate_html(scans, annotated_scans, digitized_scans, tables):
                         if i == table_data.columns.get_loc('Digitized Value'):
                             if val == '':
                                 cell_style = 'background-color: white'
-                            elif abs(float(val) - row['Value']) / float(val) < 0.05:
-                                cell_style = 'background-color: green'
-                            elif abs(float(val) - row['Value']) / float(val) < 0.1:
-                                cell_style = 'background-color: orange'
                             else:
-                                cell_style = 'background-color: red'
+                                dv = float(val)
+                                extracted = float(row['Value'])
+                                ref = abs(extracted)
+                                if ref == 0:
+                                    # Avoid divide-by-zero; only treat as exact match if both are zero.
+                                    diff_ratio = 0.0 if dv == 0 else float('inf')
+                                else:
+                                    diff_ratio = abs(dv - ref) / ref
+
+                                if diff_ratio < 0.05:
+                                    cell_style = 'background-color: green'
+                                elif diff_ratio < 0.1:
+                                    cell_style = 'background-color: orange'
+                                else:
+                                    cell_style = 'background-color: red'
                             cell_html = f'<td style="width:{width}px;{cell_style}">{val}</td>'
                         else:
                             cell_html = f'<td style="width:{width}px">{val}</td>'
