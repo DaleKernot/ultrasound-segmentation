@@ -49,6 +49,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
             - **Digitized_scans** (list): A list of the paths to the digitized scans.
             - **Annotated_scans** (list): A list of the paths to the annotated scans.
             - **Text_data** (list): A list of the text data extracted from the scans, as strings.
+            - **Mean_wave_scans** (list): Paths to mean-beat overlay PNGs (or None).
     """
 
     if filenames is None:
@@ -88,6 +89,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
     Text_data = []  # text data extracted from image
     Annotated_scans = []
     Digitized_scans = []
+    Mean_wave_scans = []
     # Paths for HTML column 1 (plain scan): same as input for images; for DICOM, a saved PNG (browser can't show .dcm)
     scan_display_paths = []
 
@@ -323,8 +325,16 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                     top_curve_coords,
                     ray_top_curve_mask,
                     ray_top_curve_coords,
+                    grow_top_curve_mask,
+                    grow_top_curve_coords,
                 ) = general_functions.segment_refinement(
-                    cv2_img, Xmin, Xmax, Ymin, Ymax, y_zero=y_zero
+                    cv2_img,
+                    Xmin,
+                    Xmax,
+                    Ymin,
+                    Ymax,
+                    y_zero=y_zero,
+                    grow_forbid_yellow=not us_dicom,
                 )
             except Exception:
                 traceback.print_exc()  # prints the error message and traceback
@@ -339,6 +349,8 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                     Ynought,
                     Xplot_o,
                     Yplot_o,
+                    Xplot_g,
+                    Yplot_g,
                 ) = general_functions.plot_digitized_data_single_axis(
                     Rnumber,
                     Rpositions,
@@ -347,6 +359,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                     ray_top_curve_coords,
                     overlay_curve_coords=top_curve_coords,
                     overlay_is_ray=False,
+                    grow_curve_coords=grow_top_curve_coords,
                 )
             elif us_dicom:
                 (
@@ -355,14 +368,25 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                     Ynought,
                     Xplot_o,
                     Yplot_o,
+                    Xplot_g,
+                    Yplot_g,
                 ) = general_functions.plot_digitized_data_dicom(
                     dicom_metadata,
                     top_curve_coords=ray_top_curve_coords,
                     overlay_curve_coords=top_curve_coords,
                     overlay_is_ray=False,
+                    grow_curve_coords=grow_top_curve_coords,
                 )
             else:
-                Xplot, Yplot, Ynought, Xplot_o, Yplot_o = [], [], [], [], []
+                Xplot, Yplot, Ynought, Xplot_o, Yplot_o, Xplot_g, Yplot_g = (
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                )
 
             # Annotation: image path uses axis masks and full annotate(), DICOM uses annotate_dicom() only.
             if us_image:
@@ -383,6 +407,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                     Right_axis=ROIR,
                     top_curve_coords=top_curve_coords,
                     ray_top_curve_coords=ray_top_curve_coords,
+                    grow_top_curve_coords=grow_top_curve_coords,
                 )
             elif us_dicom:
                 col = general_functions.annotate_dicom(
@@ -391,6 +416,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                     dicom_metadata=dicom_metadata,
                     top_curve_coords=top_curve_coords,
                     ray_top_curve_coords=ray_top_curve_coords,
+                    grow_top_curve_coords=grow_top_curve_coords,
                 )
             else:
                 col = None
@@ -418,6 +444,30 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                         df,
                         Xplot_compare=Xplot_o,
                         Yplot_compare=Yplot_o,
+                        Xplot_grow=Xplot_g,
+                        Yplot_grow=Yplot_g,
+                    )
+                    try:
+                        sf, _, _ = general_functions.digitized_hr_scale_factor_for_raster(
+                            Xplot, Yplot, df
+                        )
+                        if sf != 1.0:
+                            Xplot = general_functions.scale_raster_digitized_x(Xplot, sf)
+                            Xplot_o = general_functions.scale_raster_digitized_x(Xplot_o, sf)
+                            Xplot_g = general_functions.scale_raster_digitized_x(Xplot_g, sf)
+                    except Exception:
+                        logger.warning(
+                            "HR time scaling of digitized x failed; using arbitrary x",
+                            exc_info=True,
+                        )
+                    general_functions.finalize_image_digitized_model_choice(
+                        df,
+                        Xplot,
+                        Yplot,
+                        Xplot_o,
+                        Yplot_o,
+                        Xplot_g,
+                        Yplot_g,
                     )
                     Text_data.append(df)
                 except Exception:
@@ -430,6 +480,8 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                     Yplot,
                     Xplot_compare=Xplot_o,
                     Yplot_compare=Yplot_o,
+                    Xplot_grow=Xplot_g,
+                    Yplot_grow=Yplot_g,
                 )
                 # Prepend label row (vessel + side) at top of table for HTML
                 if label_result and not df.empty:
@@ -453,6 +505,22 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
             )
             Digitized_scans.append(Digitized_path)
 
+            Mean_wave_path = out_prefix + "_MeanWaves.png"
+            try:
+                general_functions.save_mean_waves_ray_morph_grow_figure(
+                    Mean_wave_path,
+                    Xplot,
+                    Yplot,
+                    Xplot_o,
+                    Yplot_o,
+                    Xplot_g,
+                    Yplot_g,
+                )
+                Mean_wave_scans.append(Mean_wave_path)
+            except Exception:
+                logger.warning("Mean wave figure failed", exc_info=True)
+                Mean_wave_scans.append(None)
+
         except Exception:
             logger.error("Failed Digitization")
             Annotated_scans.append(None)
@@ -464,6 +532,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                 traceback.print_exc()
                 Text_data.append(None)
             Digitized_scans.append(None)
+            Mean_wave_scans.append(None)
             Fail = Fail + 1
             pass
 
@@ -498,9 +567,18 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
         if pickle_path is None:
             pickle_path = toml.load("config.toml")["pickle"]["segmented_data"]
         with open(pickle_path, "wb") as f:
-            pickle.dump([scan_display_paths, Digitized_scans, Annotated_scans, Text_data], f)
+            pickle.dump(
+                [
+                    scan_display_paths,
+                    Digitized_scans,
+                    Annotated_scans,
+                    Text_data,
+                    Mean_wave_scans,
+                ],
+                f,
+            )
     i = 0
-    return filenames, Digitized_scans, Annotated_scans, Text_data
+    return filenames, Digitized_scans, Annotated_scans, Text_data, Mean_wave_scans
 
 
 if __name__ == "__main__":

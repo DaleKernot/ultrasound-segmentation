@@ -8,7 +8,7 @@ and the following functions:
 
 * get_likely_us
 * data_from_image
-* segment
+* segment (returns five lists; last is mean-wave PNG paths)
 * setup_tesseract
 * generate_html_from_pkl
 * generate_html

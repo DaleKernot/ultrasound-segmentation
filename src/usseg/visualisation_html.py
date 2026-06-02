@@ -2,15 +2,28 @@ import base64
 import pickle
 import toml
 
+from usseg.digitized_comparison import digitized_cell_background_style
 
-def generate_html(scans, annotated_scans, digitized_scans, tables):
+
+def generate_html(
+    scans,
+    annotated_scans,
+    digitized_scans,
+    tables,
+    mean_wave_scans=None,
+):
     # Check if the number of scan paths and data tables match
     if len(scans) != len(tables):
         raise ValueError("The number of scan paths and data tables do not match.")
+    if mean_wave_scans is None:
+        mean_wave_scans = [None] * len(scans)
+    if len(mean_wave_scans) != len(scans):
+        raise ValueError("mean_wave_scans length must match scans.")
 
     digitized_value_cols = (
         "Digitized Value (ray)",
         "Digitized Value (morph)",
+        "Digitized Value (grow)",
     )
 
     # Start building the HTML string
@@ -35,7 +48,9 @@ def generate_html(scans, annotated_scans, digitized_scans, tables):
 
     html_str += '<div style="overflow-x: scroll;white-space: nowrap;">'
     # Loop over each scan and table and add them to the HTML
-    for scan_path, Annotated_scan, Digitized_scan, table_data in zip(scans, annotated_scans, digitized_scans, tables):
+    for scan_path, Annotated_scan, Digitized_scan, Mean_wave_scan, table_data in zip(
+        scans, annotated_scans, digitized_scans, mean_wave_scans, tables
+    ):
         # Add the scan image and processed image to the HTML
         with open(scan_path, 'rb') as f:
             im_b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -52,6 +67,13 @@ def generate_html(scans, annotated_scans, digitized_scans, tables):
             with open(Digitized_scan, 'rb') as f:
                 im_b64 = base64.b64encode(f.read()).decode("utf-8")
                 html_str += f'<div style="display:inline-block;max-width:100%";padding:10px><img src="data:image/png;base64,{im_b64}" width="300"></div>'
+        else:
+            html_str += '<div style="display:inline-block;width:300px"></div>'
+
+        if Mean_wave_scan is not None:
+            with open(Mean_wave_scan, 'rb') as f:
+                im_b64 = base64.b64encode(f.read()).decode("utf-8")
+                html_str += f'<div style="display:inline-block;max-width:100%;padding:10px"><img src="data:image/png;base64,{im_b64}" width="300" alt="Mean waves"></div>'
         else:
             html_str += '<div style="display:inline-block;width:300px"></div>'
 
@@ -79,21 +101,11 @@ def generate_html(scans, annotated_scans, digitized_scans, tables):
                             if val == '':
                                 cell_style = 'background-color: white'
                             else:
-                                dv = float(val)
-                                extracted = float(row['Value'])
-                                ref = abs(extracted)
-                                if ref == 0:
-                                    # Avoid divide-by-zero; only treat as exact match if both are zero.
-                                    diff_ratio = 0.0 if dv == 0 else float('inf')
-                                else:
-                                    diff_ratio = abs(dv - ref) / ref
-
-                                if diff_ratio < 0.05:
-                                    cell_style = 'background-color: green'
-                                elif diff_ratio < 0.1:
-                                    cell_style = 'background-color: orange'
-                                else:
-                                    cell_style = 'background-color: red'
+                                cell_style = digitized_cell_background_style(
+                                    row.get("Word", ""),
+                                    float(row["Value"]),
+                                    float(val),
+                                )
                             cell_html = f'<td style="width:{width}px;{cell_style}">{val}</td>'
                         else:
                             cell_html = f'<td style="width:{width}px">{val}</td>'
@@ -122,9 +134,20 @@ def generate_html_from_pkl():
     # Loading lists from the saved file
     pickle_file = toml.load("config.toml")["pickle"]["segmented_data"]
     with open(pickle_file, 'rb') as f:
-        scan_paths, Digitized_scans, Annotated_scans, Text_data = pickle.load(f)
+        data = pickle.load(f)
+    if len(data) == 5:
+        scan_paths, Digitized_scans, Annotated_scans, Text_data, Mean_wave_scans = data
+    else:
+        scan_paths, Digitized_scans, Annotated_scans, Text_data = data
+        Mean_wave_scans = [None] * len(scan_paths)
 
-    html_str = generate_html(scan_paths, Annotated_scans, Digitized_scans, Text_data)
+    html_str = generate_html(
+        scan_paths,
+        Annotated_scans,
+        Digitized_scans,
+        Text_data,
+        mean_wave_scans=Mean_wave_scans,
+    )
     with open('generated_segmented_data.html', 'w') as f:
         f.write(html_str)
 

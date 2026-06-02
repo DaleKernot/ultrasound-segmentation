@@ -4,9 +4,11 @@ import traceback
 import math
 import re
 import logging
+from collections import deque
 
 from rapidfuzz.distance import Levenshtein
 # Module imports
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 from skimage import morphology, measure
 import numpy as np
@@ -18,7 +20,8 @@ import scipy
 from scipy.ndimage.filters import gaussian_filter
 from scipy import signal
 from scipy.spatial.distance import cdist
-from scipy.signal import find_peaks, peak_widths
+from scipy.interpolate import interp1d
+from scipy.signal import find_peaks, peak_widths, savgol_filter
 import statistics
 import scipy.linalg
 from sklearn.cluster import DBSCAN
@@ -27,11 +30,24 @@ import pydicom
 import pytesseract
 from pytesseract import Output
 
+from usseg.hemodynamic_indices import (
+    pulsatility_index_from_ps_ed_and_mean_velocity,
+    resistive_index_from_ps_ed,
+    tamax_from_envelope_temporal_mean,
+    tamax_from_ps_ed_approximation,
+)
+from usseg.digitized_comparison import (
+    returned_model_cell_value,
+    select_best_digitized_model_for_image,
+)
+
 logger = logging.getLogger(__file__)
 
 # Matplotlib tab blue for morph tracing; PIL RGBA for annotated polylines (replacing cyan).
 MORPH_CURVE_COLOR = "#1f77b4"
 MORPH_LINE_RGBA = (31, 119, 180, 255)
+GROW_CURVE_COLOR = "#b026ff"
+GROW_LINE_RGBA = (176, 38, 255, 255)
 
 # Foot-based beat detection tuning (used for feet + debug overlays).
 # Defaults chosen to match scratch `mean_wave_test.py`.
@@ -46,6 +62,25 @@ FOOT_DERIV_EDGE_GUARD = 2
 USE_SQI_FILTER = False
 # Keep saved Figure 2 clean by default (used in HTML output).
 SHOW_BEAT_DEBUG_SUBPLOTS = False
+# Region-grow: matplotlib debug (full-image trace + 3 ROI pipeline figures); not saved to batch.
+SHOW_GROW_DEBUG_PLOTS = False
+# Disk radius (pixels) for binary erosion of the refined mask before region-grow.
+# 0 disables. Shrinking the seed avoids over-thick refined blobs dominating seed
+# statistics and lets growth fill troughs; if erosion removes all seeds, the
+# full refined∩allowed seed is used instead.
+GROW_SEED_EROSION_RADIUS = 10
+# Region-grow intensity (normalized [0,1]): wider = accept dimmer neighbors (jittery tops).
+GROW_INTENSITY_TOL = 0.43
+# Hard floor: seed_mean - max(std * mult, min_drop_below_mean); autocomputed value
+# is clamped to at least GROW_MIN_INTENSITY_AUTOCOMPUTE_FLOOR (not below 0.05).
+GROW_MIN_FLOOR_STD_MULT = 5.0
+GROW_MIN_FLOOR_MIN_DROP = 0.40
+GROW_MIN_INTENSITY_AUTOCOMPUTE_FLOOR = 0.05
+# Running-mean band half-width uses max(std * mult, intensity_tol) on each side.
+GROW_RUNNING_STD_MULT = 3.9
+# Chebyshev radius per BFS step: 1 = 8-neighbour (if connectivity=8); 2 = 5×5−1
+# neighbours (24), bridging a 1-pixel gap in one hop. Larger = faster fill, more leak risk.
+GROW_NEIGHBOUR_CHEBYSHEV_RADIUS = 2
 
 root = None  # Assuming you have a reference to the main tkinter window
 
@@ -400,6 +435,691 @@ def check_inverted_curve(top_curve_mask, Ymax, Ymin, tol=.25):
     return c_range / (Ymax - Ymin) < tol
 
 
+def allowed_mask_from_roi_bounds(h: int, w: int, Xmin, Xmax, Ymin, Ymax) -> np.ndarray:
+    """
+    Boolean (H, W) mask of columns/rows kept after the same ROI cropping as
+    ``refine_waveform_segmentation`` (X / Y clamps and Ymin-50 top margin).
+    """
+    allowed = np.zeros((h, w), dtype=bool)
+    x0 = max(0, int(Xmin) - 1)
+    x1 = min(w, int(Xmax))
+    y0 = max(0, int(Ymin) - 50)
+    y1 = min(h, int(Ymax))
+    if x1 > x0 and y1 > y0:
+        allowed[y0:y1, x0:x1] = True
+    return allowed
+
+
+def _shrink_seed_for_region_grow(refined_bool, allowed_bool, erosion_radius: int):
+    """
+    Erode the refined binary mask, then intersect with ``allowed``. If the
+    result is empty, return ``refined_bool & allowed_bool`` (and log a warning).
+    """
+    refined_bool = np.asarray(refined_bool, dtype=bool)
+    allowed_bool = np.asarray(allowed_bool, dtype=bool)
+    fallback = refined_bool & allowed_bool
+    if erosion_radius <= 0:
+        return fallback
+    foot = morphology.disk(int(erosion_radius))
+    eroded = morphology.binary_erosion(refined_bool, footprint=foot)
+    shrunk = eroded & allowed_bool
+    if not np.any(shrunk):
+        logger.warning(
+            "region grow: seed erosion (disk radius=%s) removed all seeds; "
+            "using full refined∩allowed",
+            erosion_radius,
+        )
+        return fallback
+    return shrunk
+
+
+def _normalize_gray_full_image_for_grow(gray: np.ndarray) -> np.ndarray:
+    """Global min/max normalization to ``[0, 1]``, same as ``constrained_region_grow``."""
+    img = np.asarray(gray, dtype=np.float32)
+    img_min = float(np.min(img))
+    img_max = float(np.max(img))
+    if img_max > img_min:
+        return (img - img_min) / (img_max - img_min)
+    return np.zeros_like(img, dtype=np.float32)
+
+
+def _region_grow_initial_intensity_params(
+    gray,
+    seed_mask,
+    intensity_tol=None,
+    min_intensity=None,
+):
+    """
+    First-iteration intensity gates matching ``constrained_region_grow`` (before
+    running-mean updates). ``seed_mask`` is boolean, full image shape.
+    """
+    if intensity_tol is None:
+        intensity_tol = GROW_INTENSITY_TOL
+    img = _normalize_gray_full_image_for_grow(gray)
+    seed_mask = np.asarray(seed_mask, dtype=bool)
+    if not np.any(seed_mask):
+        return None
+    seed_vals = img[seed_mask]
+    seed_mean = float(np.mean(seed_vals))
+    seed_std = float(np.std(seed_vals))
+    if min_intensity is None:
+        min_intensity = max(
+            seed_mean
+            - max(
+                GROW_MIN_FLOOR_STD_MULT * seed_std,
+                GROW_MIN_FLOOR_MIN_DROP,
+            ),
+            GROW_MIN_INTENSITY_AUTOCOMPUTE_FLOOR,
+        )
+    lower_intensity = max(seed_mean - intensity_tol, min_intensity)
+    upper_intensity = min(seed_mean + intensity_tol, 1.0)
+    return {
+        "img_norm": img,
+        "seed_mean": seed_mean,
+        "seed_std": seed_std,
+        "min_intensity": float(min_intensity),
+        "lower_intensity": lower_intensity,
+        "upper_intensity": upper_intensity,
+        "intensity_tol": float(intensity_tol),
+    }
+
+
+def _bottom_most_row_per_col(mask_2d) -> np.ndarray:
+    """Per column, largest row index where ``mask`` is True; NaN if column empty."""
+    m = np.asarray(mask_2d, dtype=bool)
+    h, w = m.shape
+    rows = np.arange(h, dtype=float)[:, np.newaxis]
+    masked = np.where(m, rows, np.nan)
+    return np.nanmax(masked, axis=0)
+
+
+def _region_grow_neighbour_offsets(connectivity: int, chebyshev_radius: int):
+    """
+    Integer (dy, dx) for one flood-fill layer. Chebyshev ball: all cells with
+    ``0 < max(|dy|,|dx|) <= R`` (a square of side ``2R+1`` minus the centre).
+
+    For ``R == 1``, ``connectivity`` 4 or 8 selects the usual 4- or 8-neighbour
+    set. For ``R >= 2``, ``connectivity`` is ignored (full square).
+    """
+    r = int(chebyshev_radius)
+    if r < 1:
+        raise ValueError("chebyshev_radius must be >= 1")
+    if r == 1:
+        if connectivity == 4:
+            return ((-1, 0), (1, 0), (0, -1), (0, 1))
+        if connectivity == 8:
+            return (
+                (-1, 0),
+                (1, 0),
+                (0, -1),
+                (0, 1),
+                (-1, -1),
+                (-1, 1),
+                (1, -1),
+                (1, 1),
+            )
+        raise ValueError("connectivity must be 4 or 8 when chebyshev_radius == 1")
+    offs = []
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            if dy == 0 and dx == 0:
+                continue
+            if max(abs(dy), abs(dx)) <= r:
+                offs.append((dy, dx))
+    return tuple(offs)
+
+
+def constrained_region_grow(
+    image: np.ndarray,
+    initial_segmentation: np.ndarray,
+    allowed_mask: np.ndarray,
+    connectivity: int = 8,
+    chebyshev_radius=None,
+    intensity_tol=None,
+    update_seed_stats: bool = True,
+    max_area_growth: float = 3.0,
+    min_intensity=None,
+    forbidden_mask=None,
+) -> np.ndarray:
+    """
+    Region growing from a seed mask, constrained to ``allowed_mask`` and intensity
+    similarity to the seed. Image is normalized to [0, 1] for thresholds.
+
+    If ``forbidden_mask`` is True at a pixel, that pixel may still be part of the
+    initial seed, but the region will not **expand** into it (e.g. instrument
+    yellow overlay).
+
+    Returns a uint8 binary mask (0/1), same shape as ``image``.
+
+    ``intensity_tol`` defaults to ``GROW_INTENSITY_TOL`` when None.
+    ``chebyshev_radius`` defaults to ``GROW_NEIGHBOUR_CHEBYSHEV_RADIUS`` when None
+    (1 = one pixel step; 2 = up to two in Chebyshev distance per step).
+    """
+    if intensity_tol is None:
+        intensity_tol = float(GROW_INTENSITY_TOL)
+    if chebyshev_radius is None:
+        chebyshev_radius = int(GROW_NEIGHBOUR_CHEBYSHEV_RADIUS)
+    else:
+        chebyshev_radius = int(chebyshev_radius)
+    if image.ndim != 2:
+        raise ValueError("image must be a 2D grayscale array")
+    if initial_segmentation.shape != image.shape:
+        raise ValueError("initial_segmentation must match image shape")
+    if allowed_mask.shape != image.shape:
+        raise ValueError("allowed_mask must match image shape")
+    if forbidden_mask is not None and forbidden_mask.shape != image.shape:
+        raise ValueError("forbidden_mask must match image shape")
+    if chebyshev_radius == 1 and connectivity not in (4, 8):
+        raise ValueError("connectivity must be 4 or 8 when chebyshev_radius == 1")
+
+    h, w = image.shape
+    expand_ok = (
+        allowed_mask & (~forbidden_mask)
+        if forbidden_mask is not None
+        else allowed_mask
+    )
+    img = _normalize_gray_full_image_for_grow(image)
+
+    seed_mask = (initial_segmentation > 0) & allowed_mask
+    if not np.any(seed_mask):
+        return np.zeros_like(initial_segmentation, dtype=np.uint8)
+
+    seed_vals = img[seed_mask]
+    seed_mean = float(np.mean(seed_vals))
+    seed_std = float(np.std(seed_vals))
+    seed_area = int(np.sum(seed_mask))
+    max_area = max(int(seed_area * max_area_growth), seed_area + 1)
+
+    if min_intensity is None:
+        min_intensity = max(
+            seed_mean
+            - max(
+                GROW_MIN_FLOOR_STD_MULT * seed_std,
+                GROW_MIN_FLOOR_MIN_DROP,
+            ),
+            GROW_MIN_INTENSITY_AUTOCOMPUTE_FLOOR,
+        )
+
+    lower_intensity = max(seed_mean - intensity_tol, min_intensity)
+    upper_intensity = min(seed_mean + intensity_tol, 1.0)
+
+    grown = seed_mask.copy()
+    grown_count = seed_area
+    visited = np.zeros((h, w), dtype=bool)
+    q = deque()
+    for y, x in np.argwhere(seed_mask):
+        q.append((int(y), int(x)))
+        visited[y, x] = True
+
+    neighbours = _region_grow_neighbour_offsets(connectivity, chebyshev_radius)
+
+    running_sum = float(np.sum(seed_vals))
+    running_sq_sum = float(np.sum(seed_vals**2))
+    running_n = float(seed_vals.size)
+
+    while q:
+        y, x = q.popleft()
+        for dy, dx in neighbours:
+            ny, nx = y + dy, x + dx
+            if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                continue
+            if visited[ny, nx]:
+                continue
+            visited[ny, nx] = True
+            if not expand_ok[ny, nx] or grown[ny, nx]:
+                continue
+
+            val = float(img[ny, nx])
+            if val < min_intensity:
+                continue
+
+            if update_seed_stats and running_n > 1:
+                current_mean = running_sum / running_n
+                current_var = max(
+                    (running_sq_sum / running_n) - current_mean**2, 0.0
+                )
+                current_std = float(np.sqrt(current_var))
+                local_lower = max(
+                    current_mean
+                    - max(GROW_RUNNING_STD_MULT * current_std, intensity_tol),
+                    min_intensity,
+                )
+                local_upper = min(
+                    current_mean + max(GROW_RUNNING_STD_MULT * current_std, intensity_tol),
+                    1.0,
+                )
+            else:
+                local_lower = lower_intensity
+                local_upper = upper_intensity
+
+            if local_lower <= val <= local_upper:
+                grown[ny, nx] = True
+                grown_count += 1
+                q.append((ny, nx))
+                if update_seed_stats:
+                    running_sum += val
+                    running_sq_sum += val * val
+                    running_n += 1.0
+                if grown_count >= max_area:
+                    return grown.astype(np.uint8)
+
+    return grown.astype(np.uint8)
+
+
+def _plot_region_grow_debug(
+    input_image_bgr,
+    grown_binary_mask,
+    grow_top_curve_coords,
+):
+    """
+    Two-panel debug figure: (left) BGR image with grow top-trace polyline;
+    (right) same with semi-transparent grown-region tint and trace — similar
+    spirit to annotated overlays, for interactive inspection only.
+    """
+    rgb = cv2.cvtColor(np.asarray(input_image_bgr), cv2.COLOR_BGR2RGB)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7), sharex=True, sharey=True)
+
+    def _overlay_trace(ax, coords):
+        if coords is None or len(coords) == 0:
+            return False
+        arr = np.asarray(coords)
+        if arr.ndim != 2 or arr.shape[1] < 2:
+            return False
+        rows, cols = arr[:, 0], arr[:, 1]
+        order = np.argsort(cols)
+        ax.plot(
+            cols[order],
+            rows[order],
+            color=GROW_CURVE_COLOR,
+            linewidth=1.8,
+            label="grow trace",
+        )
+        return True
+
+    axes[0].imshow(rgb)
+    axes[0].set_title("Grow trace on image", fontsize=10)
+    axes[0].axis("off")
+    if _overlay_trace(axes[0], grow_top_curve_coords):
+        axes[0].legend(loc="upper right", fontsize=8)
+
+    axes[1].imshow(rgb)
+    axes[1].set_title("Grown mask + trace", fontsize=10)
+    axes[1].axis("off")
+    if grown_binary_mask is not None:
+        g = np.asarray(grown_binary_mask) > 0
+        if np.any(g):
+            tint = np.zeros((*rgb.shape[:2], 4), dtype=float)
+            tint[g] = mcolors.to_rgba(GROW_CURVE_COLOR, alpha=0.28)
+            axes[1].imshow(tint)
+    if _overlay_trace(axes[1], grow_top_curve_coords):
+        axes[1].legend(loc="upper right", fontsize=8)
+
+    fig.suptitle("Region-grow debug", fontsize=11, y=1.02)
+    fig.tight_layout()
+
+
+def _plot_region_grow_pipeline_debug(
+    input_image_bgr,
+    gray,
+    allowed_mask,
+    yellow_forbidden_mask,
+    refined_segmentation_mask,
+    grown_binary_mask,
+    Xmin,
+    Xmax,
+    Ymin,
+    Ymax,
+    grow_top_curve_coords=None,
+    grow_seed_mask=None,
+    intensity_tol=None,
+    roi_pad: int = 24,
+):
+    """
+    Three separate matplotlib figures (ROI zoom): (1) 3×3 mask panels, (2) troughs /
+    vertical-extent overlay, (3) two intensity-vs-row profiles with gate lines.
+
+    ``grow_seed_mask`` is the boolean mask actually passed into region growing
+    (typically eroded refined∩allowed); if None, uses ``refined ∧ allowed``.
+    """
+    h, w = gray.shape
+    x0 = max(0, int(Xmin) - 1 - roi_pad)
+    x1 = min(w, int(Xmax) + roi_pad)
+    y0 = max(0, int(Ymin) - 50 - roi_pad)
+    y1 = min(h, int(Ymax) + roi_pad)
+    x1 = max(x1, x0 + 2)
+    y1 = max(y1, y0 + 2)
+    sl_y = slice(y0, y1)
+    sl_x = slice(x0, x1)
+
+    def crop(a):
+        return np.asarray(a)[sl_y, sl_x]
+
+    allowed = np.asarray(allowed_mask, dtype=bool)
+    refined = np.asarray(refined_segmentation_mask) > 0
+    seed_full = refined & allowed
+    seed_for_grow = (
+        np.asarray(grow_seed_mask, dtype=bool)
+        if grow_seed_mask is not None
+        else seed_full
+    )
+    yellow = (
+        np.asarray(yellow_forbidden_mask, dtype=bool)
+        if yellow_forbidden_mask is not None
+        else np.zeros((h, w), dtype=bool)
+    )
+    expand_ok = allowed & (~yellow)
+    grown_full = (
+        np.asarray(grown_binary_mask) > 0
+        if grown_binary_mask is not None
+        else np.zeros((h, w), dtype=bool)
+    )
+    new_growth = grown_full & (~seed_for_grow)
+
+    if intensity_tol is None:
+        intensity_tol = GROW_INTENSITY_TOL
+
+    ip = _region_grow_initial_intensity_params(
+        gray, seed_for_grow, intensity_tol=intensity_tol
+    )
+    if ip is None:
+        fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+        ax.set_title(
+            "Region-grow pipeline (no seed: refined ∧ allowed is empty)", fontsize=11
+        )
+        ax.axis("off")
+        fig.tight_layout()
+        return
+
+    img_n = ip["img_norm"]
+    rgb = cv2.cvtColor(np.asarray(input_image_bgr), cv2.COLOR_BGR2RGB)[sl_y, sl_x]
+    titles = [
+        "RGB (ROI)",
+        "Norm gray [0,1] (grower)",
+        "Refined binary (morph output)",
+        "Allowed (ROI box)",
+        "Forbidden (yellow HSV)",
+        "Expand-OK (allowed ∧ ¬yellow)",
+        "Grow seed (BFS start; eroded ∩ allowed)",
+        "Grown mask",
+        "New pixels (grown \\ grow seed)",
+    ]
+    arrs = [
+        rgb,
+        crop(img_n),
+        crop(refined.astype(float)),
+        crop(allowed.astype(float)),
+        crop(yellow.astype(float)),
+        crop(expand_ok.astype(float)),
+        crop(seed_for_grow.astype(float)),
+        crop(grown_full.astype(float)),
+        crop(new_growth.astype(float)),
+    ]
+    cmaps = [
+        None,
+        "viridis",
+        "gray",
+        "gray",
+        "gray",
+        "gray",
+        "gray",
+        "gray",
+        "hot",
+    ]
+
+    nc = crop(img_n)
+    w_roi = nc.shape[1]
+    cols_local = np.arange(w_roi, dtype=float)
+    seed_c = crop(seed_for_grow)
+    grown_c = crop(grown_full)
+    bs = _bottom_most_row_per_col(seed_c)
+    bg = _bottom_most_row_per_col(grown_c)
+
+    gate_txt = (
+        f"Initial gates (before running-mean updates): "
+        f"seed_mean={ip['seed_mean']:.3f}  seed_std={ip['seed_std']:.3f}  "
+        f"intensity_tol={ip['intensity_tol']:.2f}  "
+        f"min_floor={ip['min_intensity']:.3f}  "
+        f"band=[{ip['lower_intensity']:.3f}, {ip['upper_intensity']:.3f}]"
+    )
+
+    # --- Figure 1: 3×3 mask grid only ---
+    fig_masks, axes_m = plt.subplots(3, 3, figsize=(16, 14))
+    for i in range(9):
+        r, c = divmod(i, 3)
+        ax = axes_m[r, c]
+        if cmaps[i] is None:
+            ax.imshow(arrs[i], aspect="auto")
+        else:
+            ax.imshow(arrs[i], cmap=cmaps[i], vmin=0, vmax=1, aspect="auto")
+        ax.set_title(titles[i], fontsize=9)
+        ax.axis("off")
+    fig_masks.suptitle(
+        f"Region-grow — masks (ROI y={y0}:{y1}, x={x0}:{x1})\n{gate_txt}",
+        fontsize=10,
+        y=0.995,
+    )
+    fig_masks.tight_layout(rect=[0, 0, 1, 0.96])
+
+    # --- Figure 2: troughs / vertical extent (single axes) ---
+    fig_trough, ax_big = plt.subplots(1, 1, figsize=(16, 8))
+    ax_big.imshow(nc, cmap="viridis", vmin=0, vmax=1, aspect="auto")
+    vb = np.isfinite(bs)
+    vg = np.isfinite(bg)
+    if np.any(vb):
+        ax_big.plot(
+            cols_local[vb],
+            bs[vb],
+            color="red",
+            linewidth=1.2,
+            label="seed bottom (max row)",
+        )
+    if np.any(vg):
+        ax_big.plot(
+            cols_local[vg],
+            bg[vg],
+            color=GROW_CURVE_COLOR,
+            linewidth=1.8,
+            label="grown bottom (max row)",
+        )
+    if grow_top_curve_coords is not None and len(grow_top_curve_coords) > 0:
+        arr = np.asarray(grow_top_curve_coords)
+        if arr.ndim == 2 and arr.shape[1] >= 2:
+            rows, cols = arr[:, 0], arr[:, 1]
+            m = (rows >= y0) & (rows < y1) & (cols >= x0) & (cols < x1)
+            if np.any(m):
+                cx = cols[m] - x0
+                ry = rows[m] - y0
+                order = np.argsort(cx)
+                ax_big.plot(
+                    cx[order],
+                    ry[order],
+                    color="cyan",
+                    linewidth=1.0,
+                    linestyle="--",
+                    label="grow top trace",
+                )
+    ax_big.set_title(
+        "Troughs / vertical extent: norm gray + per-column bottom row "
+        "(seed vs grown) + grow top trace",
+        fontsize=11,
+    )
+    ax_big.legend(loc="upper right", fontsize=8)
+    ax_big.axis("off")
+    fig_trough.suptitle(
+        f"Region-grow — troughs (ROI y={y0}:{y1}, x={x0}:{x1})",
+        fontsize=10,
+        y=1.01,
+    )
+    fig_trough.tight_layout()
+
+    # --- Figure 3: ROI context + intensity vs row (two columns profiled) ---
+    # Pre-compute column indices: centre of ROI crop, and column where grown
+    # extends furthest below seed (largest trough gap).
+    xc = w_roi // 2
+    gap = np.nan_to_num(bg - bs, nan=0.0)
+    x_rel = int(np.argmax(gap)) if w_roi > 0 else 0
+    rows_axis = np.arange(nc.shape[0], dtype=float)
+    prof_c = nc[:, xc]
+    prof_w = nc[:, x_rel]
+
+    fig_prof = plt.figure(figsize=(14, 10))
+    gs_prof = fig_prof.add_gridspec(2, 2, height_ratios=[1.15, 1.0], hspace=0.28, wspace=0.28)
+    ax_ctx = fig_prof.add_subplot(gs_prof[0, :])
+    ax_p0 = fig_prof.add_subplot(gs_prof[1, 0])
+    ax_p1 = fig_prof.add_subplot(gs_prof[1, 1])
+
+    # Context: same normalized gray as the grower; vertical lines = one-pixel-wide
+    # columns that are plotted in the row below.
+    ax_ctx.imshow(nc, cmap="viridis", vmin=0, vmax=1, aspect="auto")
+    ax_ctx.axvline(
+        xc,
+        color="lime",
+        linewidth=2.5,
+        label=f"Centre column (full x={x0 + xc})",
+    )
+    ax_ctx.axvline(
+        x_rel,
+        color="magenta",
+        linewidth=2.5,
+        label=f"Max (grown−seed) gap column (full x={x0 + x_rel})",
+    )
+    ax_ctx.set_title(
+        "Where the profiles come from: ROI normalized gray [0,1] — "
+        "vertical lines are the single columns sliced top→bottom below",
+        fontsize=10,
+    )
+    ax_ctx.set_xlabel("Column within ROI crop (0 = left)")
+    ax_ctx.set_ylabel("Row within ROI crop (0 = top)")
+    ax_ctx.legend(loc="upper right", fontsize=8)
+
+    # Black curve: intensity at each row along that one column. Vertical orange
+    # lines on the *profile* plot = constant intensity (gates), not spatial position.
+    prof_xlabel = (
+        "Normalized intensity at this row\n(same [0,1] scale as region-grow)"
+    )
+    prof_ylabel = "Row in ROI crop (scan top → bottom of lime/magenta line)"
+
+    ax_p0.plot(prof_c, rows_axis, color="black", linewidth=1.2, label="intensity")
+    ax_p0.axvline(
+        ip["lower_intensity"],
+        color="orange",
+        linestyle="--",
+        linewidth=1,
+        label="lower gate",
+    )
+    ax_p0.axvline(
+        ip["upper_intensity"],
+        color="orange",
+        linestyle=":",
+        linewidth=1,
+        label="upper gate",
+    )
+    ax_p0.axvline(
+        ip["min_intensity"],
+        color="brown",
+        linestyle="-.",
+        linewidth=1,
+        label="min floor",
+    )
+    ax_p0.axvline(ip["seed_mean"], color="lime", linewidth=1, label="seed mean")
+    ax_p0.set_xlabel(prof_xlabel, fontsize=9)
+    ax_p0.set_ylabel(prof_ylabel, fontsize=9)
+    ax_p0.set_title(
+        f"1D slice down lime line\n(full image x={x0 + xc})",
+        fontsize=10,
+    )
+    ax_p0.legend(loc="best", fontsize=6)
+    ax_p0.invert_yaxis()
+
+    ax_p1.plot(prof_w, rows_axis, color="black", linewidth=1.2, label="intensity")
+    ax_p1.axvline(ip["lower_intensity"], color="orange", linestyle="--", linewidth=1)
+    ax_p1.axvline(ip["upper_intensity"], color="orange", linestyle=":", linewidth=1)
+    ax_p1.axvline(ip["min_intensity"], color="brown", linestyle="-.", linewidth=1)
+    ax_p1.axvline(ip["seed_mean"], color="lime", linewidth=1)
+    if np.isfinite(bs[x_rel]):
+        ax_p1.axhline(
+            bs[x_rel],
+            color="red",
+            linestyle="--",
+            linewidth=0.8,
+            label="seed bottom row",
+        )
+    if np.isfinite(bg[x_rel]):
+        ax_p1.axhline(
+            bg[x_rel],
+            color=GROW_CURVE_COLOR,
+            linestyle="-",
+            linewidth=1.0,
+            label="grown bottom row",
+        )
+    ax_p1.set_xlabel(prof_xlabel, fontsize=9)
+    ax_p1.set_ylabel(prof_ylabel, fontsize=9)
+    ax_p1.set_title(
+        f"1D slice down magenta line\n(full image x={x0 + x_rel})",
+        fontsize=10,
+    )
+    ax_p1.legend(loc="best", fontsize=6)
+    ax_p1.invert_yaxis()
+
+    fig_prof.suptitle(
+        f"Region-grow — intensity profiles (ROI y={y0}:{y1}, x={x0}:{x1})",
+        fontsize=11,
+        y=0.98,
+    )
+    caption = (
+        "Bottom plots = one vertical column from the image above. For each row (top→bottom), "
+        "normalized brightness [0,1] is plotted on the horizontal axis; row index on the vertical. "
+        "Orange vertical lines are intensity gates (not x-positions in the image). "
+        "Where the black curve falls outside the band, that pixel fails the initial grow test."
+    )
+    fig_prof.text(0.5, 0.012, caption, ha="center", va="bottom", fontsize=8)
+    fig_prof.tight_layout(rect=[0, 0.08, 1, 0.94])
+
+
+def _morphological_top_curve_from_mask(mask_in, Ymin, Ymax, y_zero=None):
+    """
+    Morphological envelope + one pixel per column; same logic as the first
+    half of ``compute_top_curve``. Returns (top_curve_mask int, coords (N,2), keep str).
+    """
+    mask = np.asarray(mask_in, dtype=float).copy()
+    labelled = measure.label(mask)
+    rp = measure.regionprops(labelled)
+    if len(rp) == 0:
+        z = np.zeros_like(mask, dtype=int)
+        return z, np.empty((0, 2), dtype=int), "upper"
+
+    ws = morphology.erosion(mask).astype(float)
+    top_curve_mask = mask - ws
+    keep = "upper"
+
+    if y_zero is not None:
+        y0 = float(y_zero)
+        c_rows = np.where(np.sum(top_curve_mask, axis=1))[0]
+        above = np.sum(c_rows < y0)
+        below = np.sum(c_rows > y0)
+        inverted = below > above
+        if not inverted:
+            for r in range(int(np.floor(y0)) + 1, top_curve_mask.shape[0]):
+                top_curve_mask[r, :] = 0
+            keep = "upper"
+        else:
+            for r in range(0, int(np.ceil(y0))):
+                top_curve_mask[r, :] = 0
+            keep = "lower"
+    else:
+        for r in range(int(rp[0].centroid[0]), top_curve_mask.shape[0]):
+            top_curve_mask[r, :] = 0
+        if check_inverted_curve(top_curve_mask, Ymax, Ymin):
+            top_curve_mask = mask - ws
+            for r in range(0, int(rp[0].centroid[0])):
+                top_curve_mask[r, :] = 0
+            keep = "lower"
+
+    top_curve_mask = keep_one_pixel_per_column(top_curve_mask, keep=keep).astype(int)
+    top_curve_coords = np.column_stack(np.nonzero(top_curve_mask))
+    return top_curve_mask, top_curve_coords, keep
+
+
 def segment_refinement(
     input_image_obj,
     Xmin,
@@ -408,6 +1128,9 @@ def segment_refinement(
     Ymax,
     y_zero=None,
     ray_max_col_step_y=None,
+    grow_debug_plots=False,
+    grow_seed_erosion_radius=None,
+    grow_forbid_yellow=True,
 ):
     """
     Refines the segmentation of a waveform within specified bounds, improving 
@@ -430,6 +1153,16 @@ def segment_refinement(
             in image pixels. Currently unused, but accepted for future use.
         ray_max_col_step_y (int, optional): Max vertical step in pixels between
             neighbouring columns in ray tracing. Default derives from ray ROI height.
+        grow_debug_plots (bool, optional): If True, show matplotlib debug figures:
+            a full-image trace overlay, and three ROI pipeline figures (3×3 masks,
+            troughs-only, intensity profiles). Also respects
+            module-level ``SHOW_GROW_DEBUG_PLOTS``.
+        grow_seed_erosion_radius (int, optional): Disk radius in pixels for binary
+            erosion of the refined mask before region-grow (0 = off). Default uses
+            ``GROW_SEED_EROSION_RADIUS``.
+        grow_forbid_yellow (bool, optional): If True (default), block region-grow
+            expansion into HSV-detected instrument yellow (screenshots). Set False
+            for DICOM, where yellow is rare and the mask can remove real signal.
 
     Returns:
         (tuple) : tuple containing:
@@ -438,6 +1171,8 @@ def segment_refinement(
             - **top_curve_coords** (ndarray): ``(row, column)`` coordinates for that morphological curve.
             - **ray_top_curve_mask** (ndarray or None): Ray-traced top-curve mask, same shape as the image, or None if not computed.
             - **ray_top_curve_coords** (ndarray or None): ``(row, column)`` for the ray curve, or None if not computed.
+            - **grow_top_curve_mask** (ndarray or None): Top curve from region-growing refinement, or None if grow failed / empty.
+            - **grow_top_curve_coords** (ndarray or None): ``(row, column)`` for the grow curve, or None.
     """
 
     # 1) Produce the refined binary segmentation mask
@@ -445,12 +1180,48 @@ def segment_refinement(
         input_image_obj, Xmin, Xmax, Ymin, Ymax
     )
 
-    # 2) From that mask, derive morphological and optional ray top-curve representations
+    # 1b) Constrained region grow from refined mask (seed) within ROI bounds
+    h_img, w_img = input_image_obj.shape[:2]
+    gray = cv2.cvtColor(input_image_obj, cv2.COLOR_BGR2GRAY)
+    allowed = allowed_mask_from_roi_bounds(h_img, w_img, Xmin, Xmax, Ymin, Ymax)
+    yellow_forbidden = None
+    if grow_forbid_yellow:
+        try:
+            yellow_forbidden = hsv_yellow_tick_mask_bgr(input_image_obj)
+        except Exception:
+            logger.exception("segment_refinement: HSV yellow mask for grow failed")
+    erode_r = (
+        GROW_SEED_EROSION_RADIUS
+        if grow_seed_erosion_radius is None
+        else int(grow_seed_erosion_radius)
+    )
+    grow_seed_bool = _shrink_seed_for_region_grow(
+        np.asarray(refined_segmentation_mask) > 0,
+        allowed,
+        erode_r,
+    )
+    grow_seed_for_grow = grow_seed_bool.astype(np.float32)
+    grown_u8 = None
+    grown_binary_mask = None
+    try:
+        grown_u8 = constrained_region_grow(
+            gray,
+            grow_seed_for_grow,
+            allowed,
+            forbidden_mask=yellow_forbidden,
+        )
+        grown_binary_mask = grown_u8.astype(float)
+    except Exception:
+        logger.exception("segment_refinement: constrained_region_grow failed")
+
+    # 2) From that mask, derive morphological, optional ray, and grow top-curve representations
     (
         top_curve_mask,
         top_curve_coords,
         ray_top_curve_mask,
         ray_top_curve_coords,
+        grow_top_curve_mask,
+        grow_top_curve_coords,
     ) = compute_top_curve(
         refined_segmentation_mask,
         Ymin,
@@ -461,7 +1232,53 @@ def segment_refinement(
         Xmax=Xmax,
         plot_curve_comparison=False,
         ray_max_col_step_y=ray_max_col_step_y,
+        grown_binary_mask=(
+            grown_binary_mask
+            if (
+                grown_binary_mask is not None
+                and np.any(np.asarray(grown_binary_mask) > 0)
+            )
+            else None
+        ),
     )
+
+    if grow_debug_plots or SHOW_GROW_DEBUG_PLOTS:
+        try:
+            _plot_region_grow_pipeline_debug(
+                input_image_obj,
+                gray,
+                allowed,
+                yellow_forbidden,
+                refined_segmentation_mask,
+                grown_binary_mask,
+                Xmin,
+                Xmax,
+                Ymin,
+                Ymax,
+                grow_top_curve_coords=grow_top_curve_coords,
+                grow_seed_mask=grow_seed_bool,
+            )
+        except Exception:
+            logger.exception(
+                "segment_refinement: region-grow pipeline debug plot failed"
+            )
+        has_grow_mask = (
+            grown_binary_mask is not None
+            and np.any(np.asarray(grown_binary_mask) > 0)
+        )
+        has_grow_trace = (
+            grow_top_curve_coords is not None
+            and len(np.asarray(grow_top_curve_coords)) > 0
+        )
+        if has_grow_mask or has_grow_trace:
+            try:
+                _plot_region_grow_debug(
+                    input_image_obj,
+                    grown_binary_mask,
+                    grow_top_curve_coords,
+                )
+            except Exception:
+                logger.exception("segment_refinement: region-grow debug plot failed")
 
     return (
         refined_segmentation_mask,
@@ -469,6 +1286,8 @@ def segment_refinement(
         top_curve_coords,
         ray_top_curve_mask,
         ray_top_curve_coords,
+        grow_top_curve_mask,
+        grow_top_curve_coords,
     )
 
 
@@ -710,6 +1529,26 @@ def _pick_y_from_column_signal(
     return None
 
 
+def hsv_yellow_tick_mask_bgr(bgr: np.ndarray) -> np.ndarray:
+    """
+    Instrument yellow (ticks / trace overlay) in BGR images, using the same HSV
+    gates and opening as ``ray_trace_waveform_segmentation``. True means yellow;
+    callers typically exclude these pixels from signal or from region-growing.
+    """
+    if bgr.ndim != 3 or bgr.shape[2] != 3:
+        raise ValueError("bgr must be an HxWx3 BGR array")
+    roi_hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    sat = roi_hsv[:, :, 1].astype(np.float32)
+    val = roi_hsv[:, :, 2].astype(np.float32)
+    hue = roi_hsv[:, :, 0].astype(np.float32)
+    hue_yellow_gate = (hue >= 18) & (hue <= 40)
+    sat_gate = sat > 90
+    val_gate = val > 90
+    yellow_mask = hue_yellow_gate & sat_gate & val_gate
+    yellow_mask = morphology.opening(yellow_mask, morphology.disk(1))
+    return yellow_mask.astype(bool)
+
+
 def ray_trace_waveform_segmentation(
     input_image_obj,
     Xmin,
@@ -778,23 +1617,8 @@ def ray_trace_waveform_segmentation(
         bg_cluster,
     )
 
-    # Remove only small yellow overlays (peak ticks), while preserving the
-    # larger connected yellow trace so we do not carve artificial gaps.
-    # Use HSV-only yellow detection.
-    roi_hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-    sat = roi_hsv[:, :, 1].astype(np.float32)
-    val = roi_hsv[:, :, 2].astype(np.float32)
-    hue = roi_hsv[:, :, 0].astype(np.float32)
-    # Keep yellow detection strict to avoid bleeding into neighbouring pixels.
-    hue_yellow_gate = (hue >= 18) & (hue <= 40)
-    sat_gate = sat > 90
-    val_gate = val > 90
-    yellow_mask = hue_yellow_gate & sat_gate & val_gate
-    # Do NOT close/dilate here; that can bridge ticks to the main trace.
-    # Use a tiny opening only to remove isolated speckle noise.
-    yellow_mask = morphology.opening(yellow_mask, morphology.disk(1))
-    # Current strict HSV settings isolate tick-like yellow well; use this mask
-    # directly as ticks to remove (simpler and more stable than contour heuristics).
+    # Remove yellow overlays (peak ticks / trace), same detector as region grow.
+    yellow_mask = hsv_yellow_tick_mask_bgr(roi_bgr)
     yellow_ticks = yellow_mask.copy()
     yellow_large = np.zeros_like(yellow_mask, dtype=bool)
     signal_mask = signal_mask & (~yellow_ticks)
@@ -1009,6 +1833,7 @@ def compute_top_curve(
     Xmax=None,
     plot_curve_comparison=True,
     ray_max_col_step_y=None,
+    grown_binary_mask=None,
 ):
     """
     Given a refined segmentation mask, compute top-curve representations.
@@ -1017,6 +1842,9 @@ def compute_top_curve(
     ``top_curve_coords``). When ``input_image_obj`` and rough ``Xmin``/``Xmax``
     are provided, also runs **ray tracing** and returns ``ray_top_curve_mask`` /
     ``ray_top_curve_coords`` (or ``None`` if ray fails or yields an empty mask).
+    When ``grown_binary_mask`` is provided and non-empty, also produces
+    ``grow_top_curve_mask`` / ``grow_top_curve_coords`` via the same envelope
+    thinning as morph.
     Envelope choice ``keep`` (upper vs lower) is shared for thinning and for
     the ray tracer scan direction.
 
@@ -1026,53 +1854,18 @@ def compute_top_curve(
     If ``plot_curve_comparison`` is True, builds two figures: both coordinate
     traces on one image, and a two-panel view of the morph vs ray masks.
     """
-    # Work on a copy to avoid mutating the original refined_segmentation_mask
-    mask = refined_segmentation_mask.copy()
+    top_curve_mask, top_curve_coords, keep = _morphological_top_curve_from_mask(
+        refined_segmentation_mask, Ymin, Ymax, y_zero=y_zero
+    )
 
-    # label and calculate parameters for every cluster in mask
-    labelled = measure.label(mask)
-    rp = measure.regionprops(labelled)
-
-    ws = morphology.erosion(mask).astype(float)
-    top_curve_mask = mask - ws
-
-    keep = "upper"
-
-    if y_zero is not None:
-        # Use the physical baseline (y=0) instead of centroid to decide which
-        # side of the waveform to keep.
-        y0 = float(y_zero)
-        # Find all rows that contain part of the curve
-        c_rows = np.where(np.sum(top_curve_mask, axis=1))[0]
-        above = np.sum(c_rows < y0)
-        below = np.sum(c_rows > y0)
-
-        inverted = below > above  # majority of curve lies below baseline
-
-        if not inverted:
-            # Keep rows at or above the baseline (waveform above baseline)
-            for x in range(int(np.floor(y0)) + 1, top_curve_mask.shape[0]):
-                top_curve_mask[x, :] = 0
-            keep = "upper"
-        else:
-            # Keep rows at or below the baseline (waveform below baseline)
-            for x in range(0, int(np.ceil(y0))):
-                top_curve_mask[x, :] = 0
-            keep = "lower"
-    else:
-        # Fallback: original centroid-based logic
-        for x in range(int(rp[0].centroid[0]), top_curve_mask.shape[0]):
-            top_curve_mask[x, :] = 0
-
-        # If inverted, keep only below centroid -> "bottom half"
-        if check_inverted_curve(top_curve_mask, Ymax, Ymin):
-            top_curve_mask = mask - ws
-            for x in range(0, int(rp[0].centroid[0])):
-                top_curve_mask[x, :] = 0
-            keep = "lower"  # inverted means you want the bottom boundary
-
-    top_curve_mask = keep_one_pixel_per_column(top_curve_mask, keep=keep).astype(int)
-    top_curve_coords = np.column_stack(np.nonzero(top_curve_mask))
+    grow_top_curve_mask = None
+    grow_top_curve_coords = None
+    if grown_binary_mask is not None and np.any(np.asarray(grown_binary_mask) > 0):
+        grow_top_curve_mask, grow_top_curve_coords, _ = (
+            _morphological_top_curve_from_mask(
+                grown_binary_mask, Ymin, Ymax, y_zero=y_zero
+            )
+        )
 
     ray_top_curve_mask = None
     ray_top_curve_coords = None
@@ -1131,6 +1924,9 @@ def compute_top_curve(
                 xr, yr = _sorted_xy(ray_top_curve_coords)
                 if xr is not None:
                     ax_c.plot(xr, yr, color="red", linewidth=1.2, label="ray")
+                xg, yg = _sorted_xy(grow_top_curve_coords)
+                if xg is not None:
+                    ax_c.plot(xg, yg, color="magenta", linewidth=1.0, label="grow")
                 ax_c.legend(loc="upper right")
                 ax_c.set_title("top_curve_coords vs ray_top_curve_coords")
                 ax_c.axis("off")
@@ -1167,6 +1963,8 @@ def compute_top_curve(
         top_curve_coords,
         ray_top_curve_mask,
         ray_top_curve_coords,
+        grow_top_curve_mask,
+        grow_top_curve_coords,
     )
 
 
@@ -2442,6 +3240,7 @@ def plot_digitized_data_single_axis(
     top_curve_coords,
     overlay_curve_coords=None,
     overlay_is_ray=False,
+    grow_curve_coords=None,
 ):
     """
     Simplified digitization using a single vertical axis and a normalized X axis.
@@ -2457,10 +3256,12 @@ def plot_digitized_data_single_axis(
         overlay_curve_coords: optional second ``(row,col)`` curve for comparison.
         overlay_is_ray: if True, overlay is ray (red) and main is morph (blue);
             if False, overlay is morph (blue) and main is ray (red).
+        grow_curve_coords: optional third ``(row,col)`` region-grow curve (violet).
 
     Returns:
         Xplot, Yplot, Ynought: same semantics as ``plot_digitized_data`` (from ``top_curve_coords`` only).
         Xplot_overlay, Yplot_overlay: second series for comparison plots (empty lists if no overlay).
+        Xplot_grow, Yplot_grow: region-grow series (empty lists if no grow curve).
     """
 
     # Convert to lists defensively
@@ -2472,7 +3273,7 @@ def plot_digitized_data_single_axis(
     # If both sides are completely empty, we cannot digitize
     if not Rticks and not Lticks:
         logger.error("Digitization: both axes empty - cannot digitize waveform.")
-        return [], [], [0], [], []
+        return [], [], [0], [], [], [], []
 
     # Helper: decide which axis to use for calibration
     def choose_axis():
@@ -2525,7 +3326,7 @@ def plot_digitized_data_single_axis(
     axis_ticks, axis_locs = choose_axis()
     if axis_ticks is None or axis_locs is None:
         # Already logged
-        return [], [], [0], [], []
+        return [], [], [0], [], [], [], []
 
     # Build a simple linear mapping from pixel y to value using the chosen axis
     # Axis locations are [x, y]; we care about y here.
@@ -2534,7 +3335,7 @@ def plot_digitized_data_single_axis(
     except Exception:
         traceback.print_exc()
         logger.error("Digitization: failed to build (y, value) pairs from axis data.")
-        return [], [], [0], [], []
+        return [], [], [0], [], [], [], []
 
     # Sort by y (image coordinates)
     pairs.sort(key=lambda t: t[0])
@@ -2547,7 +3348,7 @@ def plot_digitized_data_single_axis(
             "(ys=%s).",
             ys_axis,
         )
-        return [], [], [0], [], []
+        return [], [], [0], [], [], [], []
 
     # End-point linear calibration: value = a * y + b
     a = (vals_axis[-1] - vals_axis[0]) / (ys_axis[-1] - ys_axis[0])
@@ -2557,7 +3358,7 @@ def plot_digitized_data_single_axis(
     b_coords = top_curve_coords
     if b_coords is None or len(b_coords) == 0:
         logger.error("Digitization: top_curve_coords is empty - nothing to digitize.")
-        return [], [], [0], [], []
+        return [], [], [0], [], [], [], []
 
     # Sort by (x, y) and average rows per column
     b_arr = [list(B) for B in b_coords]
@@ -2573,7 +3374,7 @@ def plot_digitized_data_single_axis(
 
     if len(X_pixels) < 2:
         logger.error("Digitization: insufficient curve points after cleaning.")
-        return [], [], [0], [], []
+        return [], [], [0], [], [], [], []
 
     # Normalize X to [0, 1] as arbitrary time axis
     Xmin_pix = min(X_pixels)
@@ -2608,10 +3409,33 @@ def plot_digitized_data_single_axis(
                 Xplot_o = [0.0 for _ in Xm]
             Yplot_o = [a * y + b for y in Ym]
 
+    Xplot_g, Yplot_g = [], []
+    if grow_curve_coords is not None and len(grow_curve_coords) > 0:
+        b_arr_g = [list(B) for B in grow_curve_coords]
+        b_swapped_g = [x[::-1] for x in b_arr_g]
+        df_g = (
+            pd.DataFrame(b_swapped_g)
+            .groupby(0, as_index=False)[1]
+            .mean()
+            .values.tolist()
+        )
+        b_clean_g = [x[::-1] for x in df_g]
+        Xm_g = [pt[1] for pt in b_clean_g]
+        Ym_g = [pt[0] for pt in b_clean_g]
+        if len(Xm_g) >= 2:
+            if Xmax_pix > Xmin_pix:
+                Xplot_g = [
+                    (x - Xmin_pix) / (Xmax_pix - Xmin_pix) for x in Xm_g
+                ]
+            else:
+                Xplot_g = [0.0 for _ in Xm_g]
+            Yplot_g = [a * y + b for y in Ym_g]
+
     # Invert waveform if mean is negative (apply to overlay too)
     if np.mean(Yplot) < 0:
         Yplot = [y * (-1) for y in Yplot]
         Yplot_o = [y * (-1) for y in Yplot_o]
+        Yplot_g = [y * (-1) for y in Yplot_g]
 
     # Additional smoothing specifically for the digitized ray series.
     # This reduces residual jitter visible in the ray-traced digitization plot.
@@ -2619,6 +3443,8 @@ def plot_digitized_data_single_axis(
         Yplot_o = _smooth_1d_digitized_shape_preserving(Yplot_o)
     else:
         Yplot = _smooth_1d_digitized_shape_preserving(Yplot)
+    if len(Yplot_g) >= 2:
+        Yplot_g = _smooth_1d_digitized_shape_preserving(Yplot_g)
 
     Ynought = [0.0]
 
@@ -2630,13 +3456,25 @@ def plot_digitized_data_single_axis(
         else:
             plt.plot(Xplot, Yplot, "-", color="red", linewidth=1.2, label="ray")
             plt.plot(Xplot_o, Yplot_o, "-", color=MORPH_CURVE_COLOR, linewidth=1.2, label="morph")
-        plt.legend(loc="best", fontsize=8)
+    elif len(Xplot_g) >= 2:
+        plt.plot(Xplot, Yplot, "-", color="red", linewidth=1.2, label="ray")
     else:
         plt.plot(Xplot, Yplot, "-")
+    if len(Xplot_g) >= 2:
+        plt.plot(
+            Xplot_g,
+            Yplot_g,
+            "-",
+            color=GROW_CURVE_COLOR,
+            linewidth=1.0,
+            label="grow",
+        )
+    if len(Xplot_o) >= 2 or len(Xplot_g) >= 2:
+        plt.legend(loc="best", fontsize=8)
     plt.xlabel("Arbitrary time scale")
     plt.ylabel("Flowrate (cm/s)")
 
-    return Xplot, Yplot, Ynought, Xplot_o, Yplot_o
+    return Xplot, Yplot, Ynought, Xplot_o, Yplot_o, Xplot_g, Yplot_g
 
 
 def _dicom_xy_from_curve_coords(top_curve_coords, dicom_metadata):
@@ -2677,6 +3515,7 @@ def plot_digitized_data_dicom(
     top_curve_coords=None,
     overlay_curve_coords=None,
     overlay_is_ray=False,
+    grow_curve_coords=None,
 ):
     """
     Digitize waveform for DICOM using metadata. Uses the same curve ordering as
@@ -2685,14 +3524,16 @@ def plot_digitized_data_dicom(
 
     ``overlay_curve_coords`` / ``overlay_is_ray`` match
     ``plot_digitized_data_single_axis`` (blue morph, red ray).
+    ``grow_curve_coords`` optional third series (violet).
 
     Returns:
-        Xplot, Yplot, Ynought, Xplot_overlay, Yplot_overlay (overlay lists may be empty).
+        Xplot, Yplot, Ynought, Xplot_overlay, Yplot_overlay (overlay lists may be empty),
+        Xplot_grow, Yplot_grow (grow lists may be empty).
     """
     Ynought = [float(dicom_metadata.get("ReferencePixelPhysicalValueY", 0.0))]
 
     if top_curve_coords is None or len(top_curve_coords) == 0:
-        return [], [], Ynought, [], []
+        return [], [], Ynought, [], [], [], []
 
     Xplot, Yplot = _dicom_xy_from_curve_coords(top_curve_coords, dicom_metadata)
 
@@ -2702,11 +3543,19 @@ def plot_digitized_data_dicom(
             overlay_curve_coords, dicom_metadata
         )
 
+    Xplot_g, Yplot_g = [], []
+    if grow_curve_coords is not None and len(grow_curve_coords) > 0:
+        Xplot_g, Yplot_g = _dicom_xy_from_curve_coords(
+            grow_curve_coords, dicom_metadata
+        )
+
     # Additional smoothing specifically for the digitized ray series.
     if overlay_is_ray:
         Yplot_o = _smooth_1d_digitized_shape_preserving(Yplot_o)
     else:
         Yplot = _smooth_1d_digitized_shape_preserving(Yplot)
+    if len(Yplot_g) >= 2:
+        Yplot_g = _smooth_1d_digitized_shape_preserving(Yplot_g)
 
     plt.figure(2)
     plt.clf()  # clear so each DICOM file gets a fresh plot (no accumulation from previous files)
@@ -2717,13 +3566,25 @@ def plot_digitized_data_dicom(
         else:
             plt.plot(Xplot, Yplot, "-", color="red", linewidth=1.2, label="ray")
             plt.plot(Xplot_o, Yplot_o, "-", color=MORPH_CURVE_COLOR, linewidth=1.2, label="morph")
-        plt.legend(loc="best", fontsize=8)
+    elif len(Xplot_g) >= 2:
+        plt.plot(Xplot, Yplot, "-", color="red", linewidth=1.2, label="ray")
     else:
         plt.plot(Xplot, Yplot, "-")
+    if len(Xplot_g) >= 2:
+        plt.plot(
+            Xplot_g,
+            Yplot_g,
+            "-",
+            color=GROW_CURVE_COLOR,
+            linewidth=1.0,
+            label="grow",
+        )
+    if len(Xplot_o) >= 2 or len(Xplot_g) >= 2:
+        plt.legend(loc="best", fontsize=8)
     plt.xlabel("Physical X (time or distance)")
     plt.ylabel("Physical Y (e.g. velocity)")
 
-    return Xplot, Yplot, Ynought, Xplot_o, Yplot_o
+    return Xplot, Yplot, Ynought, Xplot_o, Yplot_o, Xplot_g, Yplot_g
 
 
 def waveform_metrics_from_digitized(
@@ -2731,26 +3592,28 @@ def waveform_metrics_from_digitized(
     Yplot,
     Xplot_compare=None,
     Yplot_compare=None,
+    Xplot_grow=None,
+    Yplot_grow=None,
 ):
     """
     Compute waveform metrics from digitized x,y: Peak systolic (PS), End diastolic (ED),
-    and metrics derived only from those: S/D, RI, TAmax. Used for DICOM; returns a
+    and metrics derived only from those: S/D, RI, TAmax, PI. Used for DICOM; returns a
     DataFrame with the same structure so downstream (Text_data, export, HTML) can use it.
 
-    Derived:
-      S/D   = PS / ED
-      RI    = (PS - ED) / PS   (resistive index)
-      TAmax = (PS + 2*ED) / 3  (time-averaged maximum)
+    Derived (see ``usseg.hemodynamic_indices`` for RI, TAmax, PI):
+      S/D = PS / ED; RI = (PS - ED) / PS; TAmax = temporal mean of ``y`` (envelope);
+      PI = (PS - ED) / TAmax so PI and TAmax use the same denominator.
 
     Args:
         Xplot (list of float): X coordinates (time or physical axis).
         Yplot (list of float): Y coordinates (e.g. velocity).
         Xplot_compare, Yplot_compare: optional second curve (morph).
             Contract: primary (Xplot/Yplot) is ray.
+        Xplot_grow, Yplot_grow: optional third curve (region grow).
 
     Returns:
-        pandas.DataFrame: ``Digitized Value (ray)`` and ``Digitized Value (morph)``; primary
-        curve fills ray, compare curve fills morph when present.
+        pandas.DataFrame: ``Digitized Value (ray)``, ``Digitized Value (morph)``, and
+        ``Digitized Value (grow)`` when grow coordinates are present.
     """
     columns = [
         "Line",
@@ -2759,6 +3622,7 @@ def waveform_metrics_from_digitized(
         "Unit",
         "Digitized Value (ray)",
         "Digitized Value (morph)",
+        "Digitized Value (grow)",
     ]
     empty_df = pd.DataFrame(columns=columns)
 
@@ -2790,15 +3654,33 @@ def waveform_metrics_from_digitized(
             y2 = np.asarray(Yplot_compare, dtype=float)
             peaks_f2, troughs_f2, values2 = _waveform_peaks_troughs_values_from_physical_x(x2, y2)
 
+        use_grow = (
+            Xplot_grow is not None
+            and Yplot_grow is not None
+            and len(Xplot_grow) >= 2
+            and len(Xplot_grow) == len(Yplot_grow)
+        )
+        x3 = y3 = None
+        peaks_f3 = np.array([], dtype=int)
+        troughs_f3 = np.array([], dtype=int)
+        values3 = None
+        if use_grow:
+            x3 = np.asarray(Xplot_grow, dtype=float)
+            y3 = np.asarray(Yplot_grow, dtype=float)
+            peaks_f3, troughs_f3, values3 = _waveform_peaks_troughs_values_from_physical_x(x3, y3)
+
         if len(x) == len(y):
             plt.figure(2)
             plt.clf()
             if use_both:
                 plt.plot(x, y, "-", color="red", linewidth=1.2, label="ray")
                 plt.plot(x2, y2, "-", color=MORPH_CURVE_COLOR, linewidth=1.2, label="morph")
-                plt.legend(loc="best", fontsize=8)
             else:
-                plt.plot(x, y, "-")
+                plt.plot(x, y, "-", color="red", linewidth=1.2, label="ray")
+            if use_grow and x3 is not None and y3 is not None:
+                plt.plot(x3, y3, "-", color=GROW_CURVE_COLOR, linewidth=1.0, label="grow")
+            if use_both or use_grow:
+                plt.legend(loc="best", fontsize=8)
             plt.xlabel("Physical X (time or distance)")
             plt.ylabel("Physical Y (e.g. velocity)")
             if use_both and values2 is not None:
@@ -2815,8 +3697,27 @@ def waveform_metrics_from_digitized(
                     plt.plot(x[peaks_f], y[peaks_f], "x", color="C0", markersize=8, label="PS")
                 if len(troughs_f) > 0:
                     plt.plot(x[troughs_f], y[troughs_f], "x", color="C1", markersize=8, label="ED")
+            if use_grow and values3 is not None and x3 is not None and y3 is not None:
+                if len(peaks_f3) > 0:
+                    plt.plot(
+                        x3[peaks_f3],
+                        y3[peaks_f3],
+                        "^",
+                        color=GROW_CURVE_COLOR,
+                        markersize=7,
+                        label="PS (grow)",
+                    )
+                if len(troughs_f3) > 0:
+                    plt.plot(
+                        x3[troughs_f3],
+                        y3[troughs_f3],
+                        "v",
+                        color=GROW_CURVE_COLOR,
+                        markersize=7,
+                        label="ED (grow)",
+                    )
 
-        words = ["PS", "ED", "S/D", "RI", "TA"]
+        words = ["PS", "ED", "S/D", "RI", "TA", "PI"]
         rows = []
         for i, (w, v) in enumerate(zip(words, values)):
             row = {
@@ -2826,18 +3727,418 @@ def waveform_metrics_from_digitized(
                 "Unit": "",
                 "Digitized Value (ray)": "",
                 "Digitized Value (morph)": "",
+                "Digitized Value (grow)": "",
             }
             if use_both and values2 is not None:
                 row["Digitized Value (ray)"] = v
                 row["Digitized Value (morph)"] = values2[i]
             else:
                 row["Digitized Value (ray)"] = v
+            if use_grow and values3 is not None:
+                row["Digitized Value (grow)"] = values3[i]
             rows.append(row)
         return pd.DataFrame(rows, columns=columns)
     except Exception:
         logger.warning("waveform_metrics_from_digitized failed", exc_info=True)
         return empty_df
 
+
+def mean_wave(x_values, y_values, verbose=False):
+    """
+    Compute an average beat waveform from a contiguous Doppler waveform.
+
+    Method summary (aligned with current usseg beat logic):
+    1) Propose systolic anchor peaks with prominence-based peak finding and
+       merge peaks that are too close.
+    2) For each anchor peak, build a backward search window in the preceding
+       part of the beat.
+    3) In that window:
+       - smooth the signal,
+       - compute first derivative (slope) and second derivative (change in slope),
+       - find a second-derivative anchor (strongest upslope acceleration),
+       - walk backward on first derivative to the onset of low slope (foot onset).
+    4) Build beats foot-to-foot and derive PS/ED points within each beat for
+       diagnostics.
+    5) Segment foot-to-foot, align beats to a common x-axis, average, remove
+       outlier beats, and recompute the final mean wave.
+
+    Parameters
+    ----------
+    x_values : numpy array
+        Array of x values (typically time or sample position).
+    y_values : numpy array
+        Array of y values (waveform amplitude / velocity envelope).
+    verbose : bool, optional
+        If True, plot intermediate results.
+
+    Returns
+    -------
+    new_average_wave : numpy array
+        Average waveform (after beat-wise outlier filtering when applicable).
+    x_common : numpy array
+        Common x-axis corresponding to the average waveform.
+    std_wave : numpy array
+        Sample standard deviation across retained beats at each ``x_common`` point
+        (same length as ``new_average_wave``). Variance beat-to-beat at phase *i* is
+        ``std_wave[i] ** 2``.
+    """
+    x_values = np.asarray(x_values, dtype=float)
+    y_values = np.asarray(y_values, dtype=float)
+    wave_amplitude = y_values.max()-y_values.min()
+
+    peak_indices, _ = find_peaks(y_values, prominence=wave_amplitude / 4)
+    # Min separation (assume x is time): 200 bpm -> 0.3 s; merge peaks closer than that, keep highest
+    if len(peak_indices) > 1 and len(x_values) >= 2:
+        dx = float(np.median(np.diff(x_values)))
+        if np.isfinite(dx) and dx > 0:
+            min_distance = max(1, int(60.0 / 200.0 / dx))
+            order = np.argsort(peak_indices)
+            peaks = peak_indices[order]
+            consolidated = []
+            i = 0
+            while i < len(peaks):
+                j = i
+                best = int(peaks[i])
+                while j + 1 < len(peaks) and (int(peaks[j + 1]) - int(peaks[j])) <= min_distance:
+                    j += 1
+                    cand = int(peaks[j])
+                    if y_values[cand] > y_values[best]:
+                        best = cand
+                consolidated.append(best)
+                i = j + 1
+            peak_indices = np.array(consolidated, dtype=int)
+    # ------------------------------------------------------------------
+    # Foot finder aligned with current usseg logic:
+    # second-derivative anchor -> backward first-derivative onset threshold.
+    # ------------------------------------------------------------------
+    foot_indices = []
+    search_windows = []
+    debug_rows = []
+
+    search_fraction = 0.50
+    smooth_window_max = 11
+    polyorder = 2
+    min_samples_before_peak = 3
+    foot_max_rel_height = 0.55
+
+    for i in range(0, len(peak_indices)):
+        peak = int(peak_indices[i])
+        if i == 0:
+            if len(peak_indices) >= 3:
+                diffs = np.diff(peak_indices).astype(float)
+                other = diffs[1:] if len(diffs) >= 2 else diffs
+                interval_est = int(np.round(np.mean(other))) if other.size > 0 else 0
+            elif len(peak_indices) >= 2:
+                interval_est = int(peak_indices[1] - peak_indices[0])
+            else:
+                interval_est = 0
+            if interval_est < 5:
+                continue
+            interval = int(interval_est)
+            prev_peak = max(0, peak - interval)
+        else:
+            prev_peak = int(peak_indices[i - 1])
+            interval = int(peak - prev_peak)
+        if interval < 5:
+            continue
+
+        local_search_fraction = float(search_fraction) if i == 0 else max(0.0, float(search_fraction) - 0.10)
+        search_len = max(3, int(local_search_fraction * interval))
+        # If first-wave search would extend before signal start, skip this beat.
+        if i == 0 and (peak - search_len) < 0:
+            continue
+        search_start = max(prev_peak, peak - search_len)
+        search_end = max(search_start + 2, peak - int(max(1, min_samples_before_peak)))
+        if search_end <= search_start + 2:
+            continue
+
+        x_region_raw = np.asarray(x_values[search_start:search_end], dtype=float)
+        y_region = y_values[search_start:search_end]
+        if len(y_region) < 3 or x_region_raw.size != len(y_region):
+            continue
+
+        y_smooth = y_region.copy()
+        if len(y_region) >= 5:
+            win = min(smooth_window_max, len(y_region))
+            if win % 2 == 0:
+                win -= 1
+            if win >= 5:
+                y_smooth = savgol_filter(y_region, window_length=win, polyorder=polyorder)
+
+        try:
+            if np.all(np.isfinite(x_region_raw)) and (x_region_raw[-1] > x_region_raw[0]):
+                x_region = np.linspace(float(x_region_raw[0]), float(x_region_raw[-1]), int(len(x_region_raw)))
+                y_for_deriv = np.interp(x_region, x_region_raw, y_smooth)
+            else:
+                x_region = np.arange(search_end - search_start, dtype=float)
+                y_for_deriv = y_smooth
+        except Exception:
+            x_region = np.arange(search_end - search_start, dtype=float)
+            y_for_deriv = y_smooth
+
+        dy = np.gradient(y_for_deriv, x_region)
+        d2y_raw = np.gradient(dy, x_region)
+        d2y = d2y_raw.copy()
+        if len(y_region) >= 5:
+            win_d = min(smooth_window_max, len(y_region))
+            if win_d % 2 == 0:
+                win_d -= 1
+            if win_d >= 5:
+                d2y = savgol_filter(d2y_raw, window_length=win_d, polyorder=polyorder)
+
+        edge_guard = int(max(0, min(2, (len(d2y) - 1) // 2)))
+        if len(d2y) - (2 * edge_guard) >= 3:
+            d2_core = d2y[edge_guard: len(d2y) - edge_guard]
+            foot2_local = int(edge_guard + np.argmax(d2_core))
+        else:
+            foot2_local = int(np.argmax(d2y))
+
+        dy_seg = dy[: foot2_local + 1]
+        if dy_seg.size == 0:
+            continue
+        dy_max = float(np.max(dy_seg))
+        picked_local = int(foot2_local)
+        slope_thr = np.nan
+        if np.isfinite(dy_max) and dy_max > 0:
+            slope_thr = 0.08 * dy_max
+            for j in range(int(foot2_local), -1, -1):
+                if float(dy[j]) <= float(slope_thr):
+                    picked_local = int(j)
+                    break
+        picked = int(search_start + picked_local)
+
+        try:
+            trough_y = float(np.min(y_values[prev_peak:peak])) if peak > prev_peak + 1 else float(y_values[prev_peak])
+            peak_y = float(y_values[peak])
+        except Exception:
+            trough_y = float(np.min(y_region))
+            peak_y = float(np.max(y_region))
+        allowed_y = trough_y + float(foot_max_rel_height) * (peak_y - trough_y)
+        needs_fallback = (
+            picked < 0
+            or picked >= len(y_values)
+            or picked >= peak - int(max(1, min_samples_before_peak))
+            or float(y_values[picked]) > allowed_y
+        )
+        if needs_fallback:
+            seg_pre = y_values[search_start: search_start + foot2_local + 1]
+            if seg_pre.size > 0:
+                picked = int(search_start + int(np.argmin(seg_pre)))
+            else:
+                picked = int(search_start + foot2_local)
+
+        foot_indices.append(picked)
+        search_windows.append((search_start, search_end))
+        debug_rows.append(
+            {
+                "search_start": int(search_start),
+                "search_end": int(search_end),
+                "foot2_global": int(search_start + foot2_local),
+                "picked_global": int(picked),
+                "dy": np.asarray(dy, dtype=float),
+                "d2y": np.asarray(d2y, dtype=float),
+                "slope_thr": float(slope_thr) if np.isfinite(slope_thr) else np.nan,
+            }
+        )
+
+    foot_indices = np.asarray(foot_indices, dtype=int)
+    if len(foot_indices) < 2:
+        raise ValueError("Not enough foot points found to calculate mean wave.")
+    # PS/ED from foot-defined beats (same policy as usseg).
+    y_s = np.asarray(y_values, dtype=float)
+    if len(y_values) >= 5:
+        y_s = np.convolve(y_values, np.ones(5) / 5.0, mode="same")
+    ps_indices = []
+    ed_indices = []
+    for i in range(len(foot_indices) - 1):
+        a = int(foot_indices[i])
+        b = int(foot_indices[i + 1])
+        if b <= a + 2:
+            continue
+        seg = y_s[a:b]
+        anchor_in_beat = peak_indices[(peak_indices >= a) & (peak_indices < b)]
+        ps_idx = None
+        if anchor_in_beat.size > 0:
+            aa = anchor_in_beat[np.argmax(y_s[anchor_in_beat])]
+            ps_idx = int(aa)
+            ps_indices.append(ps_idx)
+        else:
+            ps_idx = int(a + int(np.argmax(seg)))
+            ps_indices.append(ps_idx)
+
+        # ED is constrained to occur after PS within the same beat.
+        ed_start = int(max(a, ps_idx + 1))
+        if ed_start < b:
+            seg_ed = y_s[ed_start:b]
+            if seg_ed.size > 0:
+                ed_indices.append(int(ed_start + int(np.argmin(seg_ed))))
+                continue
+        # Fallback for very short post-PS segments.
+        ed_indices.append(int(a + int(np.argmin(seg))))
+    segment_indices = foot_indices
+
+
+    interpolated_waves = []
+    if verbose:
+        logger.warning("mean_wave(verbose=True): use scratch/mean_wave_test.py for diagnostic plots")
+
+    for i in range(len(segment_indices) - 1):
+        # Extract data for the current segment
+        start_index = segment_indices[i]
+        end_index = segment_indices[i + 1]
+        x_segment = x_values[start_index:end_index]
+        y_segment = y_values[start_index:end_index]
+
+        # Shift x-coordinates for alignment (except the first wave)
+        if i > 0:
+            x_segment = x_segment - (x_segment[0] - x_values[segment_indices[0]])
+
+        # Initialize the common x-axis using the first segment
+        if i == 0:
+            x_min = x_segment[0]
+            x_max = x_segment[-1]
+            x_common_points = len(x_segment)
+            x_common = np.linspace(x_min, x_max, x_common_points)
+
+        # Interpolate to the common x-axis
+        interp_y = interp1d(x_segment, y_segment, kind='linear', fill_value="extrapolate")(x_common)
+        interpolated_waves.append(interp_y)
+
+    # Convert the list of interpolated waves to a NumPy array for calculations
+    interpolated_waves_np = np.vstack(interpolated_waves)
+
+    # Calculate the initial average and standard deviation
+    average_wave = np.mean(interpolated_waves_np, axis=0)
+    std_wave = np.std(interpolated_waves_np, axis=0)
+    amplitude_of_ave = np.max(average_wave)-np.min(average_wave)
+
+    if verbose:
+        plt.figure(figsize=(10, 6))
+        plt.title("Set of Waveforms")
+        plt.xlabel("Time")
+        plt.ylabel("Amplitude")
+        for wave_index, waveform in enumerate(interpolated_waves):
+            plt.plot(x_common, waveform, label=f"Waveform {wave_index}")
+        plt.plot(x_common, average_wave, label='Average wave', linestyle='-.')
+        plt.plot(x_common, average_wave+std_wave, label='Average wave + SD', linestyle='--')
+        plt.plot(x_common, average_wave-std_wave, label='Average wave - SD', linestyle='--')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+    # Filter out waves outside the range of average ± standard deviation
+    threshold_percentage = 80
+
+    filtered_waves = []
+    excluded_waves = []
+    count_excluded = 0
+    for wave in interpolated_waves_np:
+        # Calculate the percentage of points that meet the OR condition
+        within_range = (wave >= (average_wave - 0.2*amplitude_of_ave)) & (
+                    wave <= (average_wave + 0.2*amplitude_of_ave))  # Points above or equal to lower bound
+        percentage_within_range = np.sum(within_range) / len(wave) * 100
+        # Include the wave if the percentage is above the threshold
+        if percentage_within_range >= threshold_percentage:
+            filtered_waves.append(wave)
+        else:
+            count_excluded += 1
+            excluded_waves.append(wave)
+    if verbose:
+        print("Waves filtered, num excluded", count_excluded)
+
+    if verbose:
+        print(f"{len(interpolated_waves)} waveforms included in the calculationg for the average waveform,"
+              f"using a cutoff proportion of {threshold_percentage} % for points within one standard deviation of the "
+              f"raw native waveform")
+    # Recalculate the average and standard deviation with the filtered waves
+    if len(filtered_waves) == 0:
+        filtered_waves_np = interpolated_waves_np
+    else:
+        filtered_waves_np = np.vstack(filtered_waves)
+    new_average_wave = np.mean(filtered_waves_np, axis=0)
+    new_std_wave = np.std(filtered_waves_np, axis=0)
+    if verbose:
+        plt.figure(figsize=(10, 6))
+        plt.title("Average waveform")
+        plt.xlabel("Time")
+        plt.ylabel("Amplitude")
+        plt.plot(x_common, new_average_wave)
+        #plt.plot(x_common, excluded_waves[0])
+        plt.grid(True)
+        plt.show()
+
+    return new_average_wave, x_common, new_std_wave
+
+
+def save_mean_waves_ray_morph_grow_figure(
+    out_path,
+    x_ray,
+    y_ray,
+    x_morph,
+    y_morph,
+    x_grow,
+    y_grow,
+):
+    """
+    Single figure: mean beat waveform for ray, morph, and grow. Colours match the
+    digitized overlay (red / MORPH_CURVE_COLOR / GROW_CURVE_COLOR). Each trace is
+    shown on normalized beat phase [0, 1] so different beat lengths overlay.
+
+    For each method, a translucent band shows **±1 sample standard deviation** across
+    retained beats at each phase (variance = band half-width squared in (cm/s)²).
+    """
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    series = [
+        (x_ray, y_ray, "ray", "red"),
+        (x_morph, y_morph, "morph", MORPH_CURVE_COLOR),
+        (x_grow, y_grow, "grow", GROW_CURVE_COLOR),
+    ]
+    n_plotted = 0
+    for xv, yv, label, color in series:
+        if xv is None or yv is None:
+            continue
+        xa = np.asarray(xv, dtype=float)
+        ya = np.asarray(yv, dtype=float)
+        if xa.size < 3 or xa.size != ya.size:
+            continue
+        try:
+            y_avg, x_c, y_std = mean_wave(xa, ya, verbose=False)
+        except Exception:
+            logger.info("mean_wave failed for %s (need >=2 feet)", label)
+            continue
+        if x_c is None or y_avg is None or len(x_c) < 2 or len(y_avg) != len(x_c):
+            continue
+        span = float(x_c[-1] - x_c[0])
+        if np.isfinite(span) and span > 0:
+            xn = (np.asarray(x_c, dtype=float) - x_c[0]) / span
+        else:
+            xn = np.linspace(0.0, 1.0, len(x_c))
+        y_avg = np.asarray(y_avg, dtype=float)
+        y_std = np.nan_to_num(np.asarray(y_std, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+        if y_std.shape != y_avg.shape:
+            y_std = np.zeros_like(y_avg)
+        lo = y_avg - y_std
+        hi = y_avg + y_std
+        ax.fill_between(xn, lo, hi, color=color, alpha=0.22, linewidth=0, zorder=1)
+        ax.plot(xn, y_avg, color=color, linewidth=1.8, label=label, zorder=2)
+        n_plotted += 1
+    ax.set_xlabel("Normalized beat phase")
+    ax.set_ylabel("Flowrate (cm/s)")
+    ax.set_title("Mean beat ±1 SD (ray / morph / grow)")
+    ax.grid(True, alpha=0.3)
+    if n_plotted:
+        ax.legend(loc="best", fontsize=9, framealpha=0.92)
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            "No mean wave (need >=2 feet per trace)",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+    fig.savefig(out_path, dpi=900, bbox_inches="tight", pad_inches=0.05)
+    plt.close(fig)
 
 def _beat_detection_pass(x, y, min_distance):
     """
@@ -3301,7 +4602,9 @@ def _digitized_peaks_metrics_timescaled(x, y, hr, arbitrary_period_primary):
     """
     Beat detection + SQI + PS/ED-based metrics for a digitized series on arbitrary x [0, 1],
     using the primary series' mean beat period for HR time scaling (matches plot overlay x scale).
-    Returns (peaks_for_metrics, troughs_for_metrics, values_or_none).
+    Returns (peaks_for_metrics, troughs_for_metrics, values_or_none) where values_or_none lists
+    six rounded floats: PS, ED, S/D, RI, TAmax, PI. TAmax is the temporal mean of ``y``;
+    PI uses that same mean (see ``usseg.hemodynamic_indices``).
     """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -3358,14 +4661,17 @@ def _digitized_peaks_metrics_timescaled(x, y, hr, arbitrary_period_primary):
             if ED == 0:
                 ED = np.finfo(float).eps
             SoverD = PS / ED
-            RI = (PS - ED) / PS if PS != 0 else 0.0
-            TAmax = (PS + 2 * ED) / 3.0
+            RI = resistive_index_from_ps_ed(PS, ED)
+            mean_v = float(np.mean(y))
+            TAmax = tamax_from_envelope_temporal_mean(mean_v)
+            PI = pulsatility_index_from_ps_ed_and_mean_velocity(PS, ED, mean_v)
             values = [
                 round(PS, 2),
                 round(ED, 2),
                 round(SoverD, 2),
                 round(RI, 2),
                 round(TAmax, 2),
+                round(PI, 2),
             ]
             return peaks_for_metrics, troughs_for_metrics, values
     except Exception:
@@ -3376,7 +4682,8 @@ def _digitized_peaks_metrics_timescaled(x, y, hr, arbitrary_period_primary):
 def _waveform_peaks_troughs_values_from_physical_x(x, y):
     """
     Beat detection + SQI + waveform metrics when x is already in physical units (e.g. DICOM time).
-    Returns (peaks_f, troughs_f, values_or_none) where values_or_none is five rounded floats or None.
+    Returns (peaks_f, troughs_f, values_or_none) where values_or_none is six rounded floats
+    (PS, ED, S/D, RI, TAmax, PI) or None. TAmax is the temporal mean of ``y``; PI divides by the same mean.
     """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -3416,14 +4723,17 @@ def _waveform_peaks_troughs_values_from_physical_x(x, y):
         if ED == 0:
             ED = np.finfo(float).eps
         SoverD = PS / ED
-        RI = (PS - ED) / PS if PS != 0 else 0.0
-        TAmax = (PS + 2 * ED) / 3.0
+        RI = resistive_index_from_ps_ed(PS, ED)
+        mean_v = float(np.mean(y))
+        TAmax = tamax_from_envelope_temporal_mean(mean_v)
+        PI = pulsatility_index_from_ps_ed_and_mean_velocity(PS, ED, mean_v)
         values = [
             round(PS, 2),
             round(ED, 2),
             round(SoverD, 2),
             round(RI, 2),
             round(TAmax, 2),
+            round(PI, 2),
         ]
         return peaks_f, troughs_f, values
     except Exception:
@@ -3502,12 +4812,111 @@ def _sqi_template_correlation(y, peaks, troughs, template_len=200, min_corr=0.85
     return good_peaks_mask, good_troughs_mask
 
 
+def digitized_hr_scale_factor_for_raster(Xplot_ray, Yplot_ray, df):
+    """
+    Same HR + mean foot spacing rule as ``plot_correction``: arbitrary x (typically
+    [0, 1] from ``plot_digitized_data_single_axis``) is multiplied by this factor
+    to get time in seconds when OCR ``df`` contains a valid HR.
+
+    Returns:
+        scale_factor (float): multiply arbitrary x by this; 1.0 if HR missing/invalid
+            or beat detection fails to yield foot spacing.
+        hr (float): HR from df, or 0.0 if missing/invalid.
+        arbitrary_period (float): mean x-spacing between feet on arbitrary axis, or 1.0.
+    """
+    x = np.asarray(Xplot_ray, dtype=float)
+    y = np.asarray(Yplot_ray, dtype=float)
+    arbitrary_period = 1.0
+    if len(y) >= 3 and len(x) == len(y):
+        min_distance_pass1 = max(1, len(x) // 15)
+        feet1, peaks1, troughs1 = _beat_detection_pass_feet(x, y, min_distance_pass1)
+        if feet1.size >= 2 and peaks1.size > 0 and troughs1.size > 0:
+            feet = feet1
+            if len(feet) >= 2:
+                arbitrary_period = float(x[int(feet[-1])] - x[int(feet[0])]) / max(
+                    1, len(feet) - 1
+                )
+    hr = 0.0
+    try:
+        hr_vals = df.loc[df["Word"].str.contains("HR"), "Value"].values
+        hr = float(hr_vals[0]) if len(hr_vals) > 0 else 0.0
+    except Exception:
+        pass
+    if not np.isfinite(hr) or hr <= 0.0 or not np.isfinite(arbitrary_period) or arbitrary_period <= 0:
+        return 1.0, float(hr) if np.isfinite(hr) else 0.0, arbitrary_period
+    real_period = 60.0 / hr
+    scale_factor = real_period / arbitrary_period
+    return float(scale_factor), float(hr), float(arbitrary_period)
+
+
+def scale_raster_digitized_x(x_list, scale_factor):
+    """Scale a digitized x series by ``scale_factor``; pass-through if empty or factor is 1."""
+    if x_list is None or len(x_list) == 0 or scale_factor == 1.0:
+        return x_list
+    return (np.asarray(x_list, dtype=float) * float(scale_factor)).tolist()
+
+
+def finalize_image_digitized_model_choice(
+    df,
+    x_ray,
+    y_ray,
+    x_morph,
+    y_morph,
+    x_grow,
+    y_grow,
+):
+    """
+    For **raster images** only: score ray / morph / grow digitized columns vs OCR ``Value``
+    (same traffic-light rules as HTML), set ``df[\"Returned model\"]``, and return the
+    selected ``(x, y)`` after HR scaling.
+
+    Call after ``plot_correction`` (when digitized columns exist) and after any HR
+    x-axis scaling so returned coordinates match the final time axis.
+
+    If the chosen curve is too short, falls back to the first non-empty series among
+    ray, morph, grow and updates ``Returned model`` accordingly.
+    """
+    pairs = {
+        "ray": (list(x_ray or []), list(y_ray or [])),
+        "morph": (list(x_morph or []), list(y_morph or [])),
+        "grow": (list(x_grow or []), list(y_grow or [])),
+    }
+
+    def _pick_nonempty(preferred_key: str) -> tuple[str, list, list]:
+        order = [preferred_key, "ray", "morph", "grow"]
+        seen = set()
+        for k in order:
+            if k in seen:
+                continue
+            seen.add(k)
+            xk, yk = pairs[k]
+            if len(xk) >= 2 and len(xk) == len(yk):
+                return k, xk, yk
+        xr, yr = pairs["ray"]
+        return "ray", xr, yr
+
+    if df is None:
+        _, xs, ys = _pick_nonempty("ray")
+        return xs, ys
+
+    if "Digitized Value (ray)" not in df.columns:
+        best = "ray"
+    else:
+        best = select_best_digitized_model_for_image(df)
+
+    k, x_pick, y_pick = _pick_nonempty(best)
+    df["Returned model"] = returned_model_cell_value(k)
+    return x_pick, y_pick
+
+
 def plot_correction(
     Xplot,
     Yplot,
     df,
     Xplot_compare=None,
     Yplot_compare=None,
+    Xplot_grow=None,
+    Yplot_grow=None,
 ):
     """
     Adjusts and corrects the digitized waveform data using extracted text data, identifies
@@ -3525,21 +4934,25 @@ def plot_correction(
                                hemodynamic parameters and heart rate.
         Xplot_compare, Yplot_compare: optional second digitized series (morph).
             Contract: primary (Xplot/Yplot) is ray, compare is morph.
+        Xplot_grow, Yplot_grow: optional third digitized series (region grow).
 
     Returns:
-        **df** (pandas.DataFrame): ``Digitized Value (ray)`` and ``Digitized Value (morph)`` only
-        (no duplicate aggregate column).
+        **df** (pandas.DataFrame): ``Digitized Value (ray)``, ``Digitized Value (morph)``,
+        and ``Digitized Value (grow)`` when grow coordinates are present.
     """
     y = np.array(Yplot, dtype=float)
     x = np.array(Xplot, dtype=float)
     df.insert(loc=3, column="Digitized Value (ray)", value="")
     df.insert(loc=4, column="Digitized Value (morph)", value="")
+    df.insert(loc=5, column="Digitized Value (grow)", value="")
     peaks = np.array([], dtype=int)
     troughs = np.array([], dtype=int)
     peaks_for_metrics = np.array([], dtype=int)
     troughs_for_metrics = np.array([], dtype=int)
     peaks_compare_m = np.array([], dtype=int)
     troughs_compare_m = np.array([], dtype=int)
+    peaks_grow_m = np.array([], dtype=int)
+    troughs_grow_m = np.array([], dtype=int)
     arbitrary_period = 1.0
     x_time = None
     hr = 0.0
@@ -3615,11 +5028,19 @@ def plot_correction(
             if ED == 0:
                 ED = np.finfo(float).eps
             SoverD = PS / ED
-            RI = (PS - ED) / PS if PS != 0 else 0.0
-            TAmax = (PS + 2 * ED) / 3.0
-            PI = (PS - ED) / float(np.mean(y)) if np.mean(y) != 0 else 0.0
-            words = ["PS", "ED", "S/D", "RI", "TA"]
-            values = [round(PS, 2), round(ED, 2), round(SoverD, 2), round(RI, 2), round(TAmax, 2)]
+            RI = resistive_index_from_ps_ed(PS, ED)
+            mean_v = float(np.mean(y))
+            TAmax = tamax_from_envelope_temporal_mean(mean_v)
+            PI = pulsatility_index_from_ps_ed_and_mean_velocity(PS, ED, mean_v)
+            words = ["PS", "ED", "S/D", "RI", "TA", "PI"]
+            values = [
+                round(PS, 2),
+                round(ED, 2),
+                round(SoverD, 2),
+                round(RI, 2),
+                round(TAmax, 2),
+                round(PI, 2),
+            ]
             has_compare = (
                 Xplot_compare is not None
                 and Yplot_compare is not None
@@ -3647,6 +5068,26 @@ def plot_correction(
                         except Exception:
                             continue
 
+            has_grow = (
+                Xplot_grow is not None
+                and Yplot_grow is not None
+                and len(Xplot_grow) >= 2
+                and len(Xplot_grow) == len(Yplot_grow)
+            )
+            if has_grow:
+                x_grow = np.asarray(Xplot_grow, dtype=float)
+                y_grow = np.asarray(Yplot_grow, dtype=float)
+                peaks_grow_m, troughs_grow_m, vals_grow = _digitized_peaks_metrics_timescaled(
+                    x_grow, y_grow, hr, arbitrary_period
+                )
+                if vals_grow:
+                    for i in range(len(words)):
+                        try:
+                            m = df["Word"].str.contains(words[i])
+                            df.loc[m, "Digitized Value (grow)"] = vals_grow[i]
+                        except Exception:
+                            continue
+
     except Exception:
         traceback.print_exc()
         arbitrary_period = 1.0
@@ -3655,11 +5096,8 @@ def plot_correction(
     # arbitrary x when HR invalid so markers are still drawn.
     # -------------------------------------------------------------------------
     try:
-        hr_vals = df.loc[df["Word"].str.contains("HR"), "Value"].values
-        hr = float(hr_vals[0]) if len(hr_vals) > 0 else 0.0
+        scale_factor, hr, _ = digitized_hr_scale_factor_for_raster(Xplot, Yplot, df)
         if np.isfinite(hr) and hr > 0.0:
-            real_period = 1.0 / (hr / 60.0)
-            scale_factor = real_period / arbitrary_period
             x_plot = x * scale_factor
             xlabel = "Time (s)"
         else:
@@ -3682,6 +5120,22 @@ def plot_correction(
                 x_plot_o = x_o * scale_factor
             else:
                 x_plot_o = x_o
+
+        use_grow_plot = (
+            Xplot_grow is not None
+            and Yplot_grow is not None
+            and len(Xplot_grow) >= 2
+            and len(Xplot_grow) == len(Yplot_grow)
+        )
+        x_plot_g = None
+        y_g = None
+        if use_grow_plot:
+            x_g_src = np.asarray(Xplot_grow, dtype=float)
+            y_g = np.asarray(Yplot_grow, dtype=float)
+            if np.isfinite(hr) and hr > 0.0:
+                x_plot_g = x_g_src * scale_factor
+            else:
+                x_plot_g = x_g_src
 
         plt.close(2)
         fig2 = plt.figure(2)
@@ -3707,6 +5161,15 @@ def plot_correction(
             ax_sig.plot(x_plot_o, y_o, "-", color=morph_color, linewidth=1.8, label="morph")
         else:
             ax_sig.plot(x_plot, y, "-", color=ray_color, linewidth=1.8, label="ray")
+        if use_grow_plot and x_plot_g is not None and y_g is not None:
+            ax_sig.plot(
+                x_plot_g,
+                y_g,
+                "-",
+                color=GROW_CURVE_COLOR,
+                linewidth=1.6,
+                label="grow",
+            )
 
         # ---------------------------------------------------------------------
         # Visualise EXACT detection windows/anchors/feet by using the same peak
@@ -3741,6 +5204,13 @@ def plot_correction(
         if use_compare and x_plot_o is not None and y_o is not None and len(x_plot_o) == len(y_o):
             anchor_peaks_compare, feet_plot_compare, debug_rows_compare = _anchors_and_debug(
                 x_plot_o, y_o, max(1, len(x_plot_o) // 15)
+            )
+
+        anchor_peaks_grow = np.array([], dtype=int)
+        feet_plot_grow = np.array([], dtype=int)
+        if use_grow_plot and x_plot_g is not None and y_g is not None and len(x_plot_g) == len(y_g):
+            anchor_peaks_grow, feet_plot_grow, _debug_rows_grow = _anchors_and_debug(
+                x_plot_g, y_g, max(1, len(x_plot_g) // 15)
             )
 
         # Shade windows + plot anchor peaks (on top of the waveform)
@@ -3835,14 +5305,43 @@ def plot_correction(
                 troughs_compare_m = np.asarray(feet_plot_compare[:-1], dtype=int)
             elif feet_plot_compare is not None and len(feet_plot_compare) == 1:
                 troughs_compare_m = np.asarray(feet_plot_compare, dtype=int)
+        if use_grow_plot and x_plot_g is not None and (
+            peaks_grow_m is None or len(peaks_grow_m) == 0
+        ):
+            peaks_grow_m = np.asarray(anchor_peaks_grow, dtype=int)
+        if use_grow_plot and x_plot_g is not None and (
+            troughs_grow_m is None or len(troughs_grow_m) == 0
+        ):
+            if feet_plot_grow is not None and len(feet_plot_grow) >= 2:
+                troughs_grow_m = np.asarray(feet_plot_grow[:-1], dtype=int)
+            elif feet_plot_grow is not None and len(feet_plot_grow) == 1:
+                troughs_grow_m = np.asarray(feet_plot_grow, dtype=int)
 
         # Beat delimiters on saved plot: faint dashed vertical lines at foot boundaries.
-        if feet_plot_primary is not None and len(feet_plot_primary) >= 2:
-            fb = np.asarray(feet_plot_primary, dtype=int)
-            fb = fb[(fb >= 0) & (fb < len(x_plot))]
+        # When morph (compare) is present, use morph feet and x so delimiters match the morph trace.
+        _x_delim = x_plot
+        _feet_delim = feet_plot_primary
+        _ap_delim = anchor_peaks_primary
+        if (
+            use_compare
+            and x_plot_o is not None
+            and y_o is not None
+            and feet_plot_compare is not None
+            and len(feet_plot_compare) >= 2
+        ):
+            _fc = np.asarray(feet_plot_compare, dtype=int)
+            _fc = _fc[(_fc >= 0) & (_fc < len(x_plot_o))]
+            if _fc.size >= 2:
+                _x_delim = x_plot_o
+                _feet_delim = _fc
+                _ap_delim = anchor_peaks_compare
+
+        if _feet_delim is not None and len(_feet_delim) >= 2:
+            fb = np.asarray(_feet_delim, dtype=int)
+            fb = fb[(fb >= 0) & (fb < len(_x_delim))]
             for kk, fi in enumerate(fb):
                 ax_sig.axvline(
-                    x_plot[int(fi)],
+                    _x_delim[int(fi)],
                     linestyle="--",
                     linewidth=0.8,
                     color="0.45",
@@ -3854,28 +5353,28 @@ def plot_correction(
         # Light red shading for incomplete edge regions (only if incomplete).
         # Start is incomplete when the first detected foot is not near the left edge.
         # End is incomplete when there is an anchor peak after the last detected foot.
-        if feet_plot_primary is not None and len(feet_plot_primary) > 0:
-            fp = np.asarray(feet_plot_primary, dtype=int)
-            fp = fp[(fp >= 0) & (fp < len(x_plot))]
+        if _feet_delim is not None and len(_feet_delim) > 0:
+            fp = np.asarray(_feet_delim, dtype=int)
+            fp = fp[(fp >= 0) & (fp < len(_x_delim))]
             if fp.size > 0:
                 # Incomplete first wave
                 if int(fp[0]) > 0:
                     ax_sig.axvspan(
-                        x_plot[0],
-                        x_plot[int(fp[0])],
+                        _x_delim[0],
+                        _x_delim[int(fp[0])],
                         color="#ff6b6b",
                         alpha=0.08,
                         zorder=0,
                         label="incomplete region",
                     )
                 # Incomplete last wave
-                if anchor_peaks_primary is not None and len(anchor_peaks_primary) > 0:
-                    ap = np.asarray(anchor_peaks_primary, dtype=int)
-                    ap = ap[(ap >= 0) & (ap < len(x_plot))]
+                if _ap_delim is not None and len(_ap_delim) > 0:
+                    ap = np.asarray(_ap_delim, dtype=int)
+                    ap = ap[(ap >= 0) & (ap < len(_x_delim))]
                     if ap.size > 0 and int(ap[-1]) > int(fp[-1]):
                         ax_sig.axvspan(
-                            x_plot[int(fp[-1])],
-                            x_plot[-1],
+                            _x_delim[int(fp[-1])],
+                            _x_delim[-1],
                             color="#ff6b6b",
                             alpha=0.08,
                             zorder=0,
@@ -3994,6 +5493,14 @@ def plot_correction(
                 int(len(peaks_compare_m)),
                 int(len(troughs_compare_m)),
             )
+        if use_grow_plot and x_plot_g is not None and (
+            len(peaks_grow_m) == 0 or len(troughs_grow_m) == 0
+        ):
+            logger.info(
+                "plot_correction: grow beat markers missing (peaks=%d troughs=%d).",
+                int(len(peaks_grow_m)),
+                int(len(troughs_grow_m)),
+            )
 
         if use_compare and x_plot_o is not None:
             if len(peaks_for_metrics) > 0:
@@ -4063,6 +5570,29 @@ def plot_correction(
                     zorder=4,
                     label="ED",
                 )
+        if use_grow_plot and x_plot_g is not None and y_g is not None:
+            if len(peaks_grow_m) > 0:
+                ax_sig.plot(
+                    x_plot_g[peaks_grow_m],
+                    y_g[peaks_grow_m],
+                    "^",
+                    color=GROW_CURVE_COLOR,
+                    alpha=0.35,
+                    markersize=6,
+                    zorder=4,
+                    label="PS (grow)",
+                )
+            if len(troughs_grow_m) > 0:
+                ax_sig.plot(
+                    x_plot_g[troughs_grow_m],
+                    y_g[troughs_grow_m],
+                    "v",
+                    color=GROW_CURVE_COLOR,
+                    alpha=0.35,
+                    markersize=6,
+                    zorder=4,
+                    label="ED (grow)",
+                )
         # Build top legend AFTER all markers are added, with de-duplicated labels.
         try:
             handles, labels = ax_sig.get_legend_handles_labels()
@@ -4071,14 +5601,31 @@ def plot_correction(
                 if l and l not in uniq:
                     uniq[l] = h
             if len(uniq) > 0:
-                ax_sig.legend(list(uniq.values()), list(uniq.keys()), loc="best", fontsize=7)
+                ax_sig.legend(
+                    list(uniq.values()),
+                    list(uniq.keys()),
+                    loc="lower left",
+                    ncol=2,
+                    fontsize=7,
+                    framealpha=0.92,
+                )
         except Exception:
             pass
-        if not any(np.isnan(v) or v == 0 or np.isinf(v) for v in x_plot):
-            ax_sig.set_xlim((min(x_plot), max(x_plot)))
+        x_lo = float(np.min(x_plot))
+        x_hi = float(np.max(x_plot))
+        if use_compare and x_plot_o is not None and y_o is not None and y_o.size:
+            x_lo = min(x_lo, float(np.min(x_plot_o)))
+            x_hi = max(x_hi, float(np.max(x_plot_o)))
+        if use_grow_plot and x_plot_g is not None and y_g is not None and y_g.size:
+            x_lo = min(x_lo, float(np.min(x_plot_g)))
+            x_hi = max(x_hi, float(np.max(x_plot_g)))
+        if np.isfinite(x_lo) and np.isfinite(x_hi) and x_hi > x_lo:
+            ax_sig.set_xlim((x_lo, x_hi))
         y_hi = float(np.max(y))
         if use_compare and y_o is not None and y_o.size:
             y_hi = max(y_hi, float(np.max(y_o)))
+        if use_grow_plot and y_g is not None and y_g.size:
+            y_hi = max(y_hi, float(np.max(y_g)))
         ax_sig.set_ylim((0, y_hi + 10))
     except Exception:
         logger.warning("Could not plot digitization waveform; continuing.", exc_info=True)
@@ -4274,11 +5821,13 @@ def _draw_curve_polylines_rgba(
     img_rgba,
     top_curve_coords=None,
     ray_top_curve_coords=None,
+    grow_top_curve_coords=None,
     morph_line_rgba=MORPH_LINE_RGBA,
     ray_line_rgba=(255, 0, 0, 255),
+    grow_line_rgba=GROW_LINE_RGBA,
     line_width=2,
 ):
-    """Overlay morphological (blue) and ray (red) polylines on a PIL RGBA image."""
+    """Overlay morph (blue), ray (red), and optional grow (violet) polylines on PIL RGBA."""
     draw = ImageDraw.Draw(img_rgba)
     pts_m = _sorted_xy_points_pil_from_curve_coords(top_curve_coords)
     if pts_m is not None:
@@ -4286,6 +5835,9 @@ def _draw_curve_polylines_rgba(
     pts_r = _sorted_xy_points_pil_from_curve_coords(ray_top_curve_coords)
     if pts_r is not None:
         draw.line(pts_r, fill=ray_line_rgba, width=line_width)
+    pts_g = _sorted_xy_points_pil_from_curve_coords(grow_top_curve_coords)
+    if pts_g is not None:
+        draw.line(pts_g, fill=grow_line_rgba, width=line_width)
 
 
 def annotate(
@@ -4298,6 +5850,7 @@ def annotate(
         Right_axis,
         top_curve_coords=None,
         ray_top_curve_coords=None,
+        grow_top_curve_coords=None,
 ):
     """
     Visual aid for evaluating segmentation.
@@ -4326,6 +5879,7 @@ def annotate(
         Right_axis (numpy.ndarray): The segmentation mask (ticks and labels) for the right axis.
         top_curve_coords (ndarray, optional): ``(row, col)`` morphological envelope curve.
         ray_top_curve_coords (ndarray, optional): ``(row, col)`` ray-traced curve.
+        grow_top_curve_coords (ndarray, optional): ``(row, col)`` region-grow envelope curve.
 
     Returns:
         PIL.Image.Image: The annotated image with ROIs color-coded and highlighted.
@@ -4386,6 +5940,7 @@ def annotate(
         img_RGB,
         top_curve_coords=top_curve_coords,
         ray_top_curve_coords=ray_top_curve_coords,
+        grow_top_curve_coords=grow_top_curve_coords,
     )
     return img_RGB
 
@@ -4396,6 +5951,7 @@ def annotate_dicom(
     dicom_metadata,
     top_curve_coords=None,
     ray_top_curve_coords=None,
+    grow_top_curve_coords=None,
 ):
     """
     DICOM-only annotation: overlay waveform segmentation and waveform ROI box
@@ -4407,7 +5963,8 @@ def annotate_dicom(
         refined_segmentation_mask (numpy.ndarray): Segmentation mask (1=waveform, same shape as image).
         dicom_metadata (dict): Must contain RegionLocationMinX0, RegionLocationMaxX1,
             RegionLocationMinY0, RegionLocationMaxY1 for the waveform box.
-        top_curve_coords, ray_top_curve_coords (ndarray, optional): ``(row, col)`` curves to draw.
+        top_curve_coords, ray_top_curve_coords, grow_top_curve_coords (ndarray, optional):
+            ``(row, col)`` curves to draw.
 
     Returns:
         PIL.Image.Image: Annotated image (RGBA) with waveform in red, ROI outline in green.
@@ -4449,6 +6006,7 @@ def annotate_dicom(
         img,
         top_curve_coords=top_curve_coords,
         ray_top_curve_coords=ray_top_curve_coords,
+        grow_top_curve_coords=grow_top_curve_coords,
     )
     return img
 
@@ -5387,8 +6945,8 @@ def metric_check(df):
     SoverD_calc = PS / ED
     # Find RI
     RI_calc = (PS - ED) / PS
-    # Find TAmax
-    TAmax_calc = (PS + (2 * ED)) / 3 # Approximaton of TAmax, to be used as a fallback.
+    # Find TAmax (PS/ED-only surrogate; no waveform here — see ``tamax_from_ps_ed_approximation``)
+    TAmax_calc = tamax_from_ps_ed_approximation(PS, ED)
 
     # Now check whether the PS & ED dependant metrics are consistent between calculated and extracted:
     # Extracted values with default as None if not present
@@ -5458,8 +7016,12 @@ def metric_check(df):
             # Now, using these new ED values, recalculate the metrics
             SoverD_from_ED_from_RI = PS / ED_from_RI if ED_from_RI else None
             RI_from_ED_from_SoverD = (PS - ED_from_SoverD) / PS if ED_from_SoverD else None
-            TAmax_from_ED_from_SoverD = (PS + 2 * ED_from_SoverD) / 3 if ED_from_SoverD else None
-            TAmax_from_ED_from_RI = (PS + 2 * ED_from_RI) / 3 if ED_from_RI else None
+            TAmax_from_ED_from_SoverD = (
+                tamax_from_ps_ed_approximation(PS, ED_from_SoverD) if ED_from_SoverD else None
+            )
+            TAmax_from_ED_from_RI = (
+                tamax_from_ps_ed_approximation(PS, ED_from_RI) if ED_from_RI else None
+            )
 
             values_to_insert = {
                 'ED_from_SoverD': ED_from_SoverD,
@@ -5483,8 +7045,12 @@ def metric_check(df):
                 # Now, using these new PS values, recalculate the other metrics
                 SoverD_from_PS_from_RI = PS_from_RI / ED if PS_from_RI else None
                 RI_from_PS_from_SoverD = (PS_from_SoverD - ED) / PS_from_SoverD if PS_from_SoverD else None
-                TAmax_from_PS_from_SoverD = (PS_from_SoverD + 2 * ED) / 3 if PS_from_SoverD else None
-                TAmax_from_PS_from_RI = (PS_from_RI + 2 * ED) / 3 if PS_from_RI else None
+                TAmax_from_PS_from_SoverD = (
+                    tamax_from_ps_ed_approximation(PS_from_SoverD, ED) if PS_from_SoverD else None
+                )
+                TAmax_from_PS_from_RI = (
+                    tamax_from_ps_ed_approximation(PS_from_RI, ED) if PS_from_RI else None
+                )
 
                 values_to_insert = {
                     'PS_from_SoverD': PS_from_SoverD,
@@ -5516,7 +7082,9 @@ def metric_check(df):
                     # Find RI
                     df.loc[df['Word'].str.contains('RI'), 'Value'] = round((PS - ED) / PS, 2)
                     # Find TAmax
-                    df.loc[df['Word'].str.contains('TAmax'), 'Value'] = round((PS + (2 * ED)) / 3, 2)
+                    df.loc[df['Word'].str.contains('TAmax'), 'Value'] = round(
+                        tamax_from_ps_ed_approximation(PS, ED), 2
+                    )
 
             elif len(conditions_met) > 0:
 
@@ -5535,7 +7103,9 @@ def metric_check(df):
                 # Find RI
                 df.loc[df['Word'].str.contains('RI'), 'Value'] = round((PS - ED) / PS, 2)
                 # Find TAmax
-                df.loc[df['Word'].str.contains('TAmax'), 'Value'] = round((PS + (2 * ED)) / 3, 2)
+                df.loc[df['Word'].str.contains('TAmax'), 'Value'] = round(
+                    tamax_from_ps_ed_approximation(PS, ED), 2
+                )
 
         except ZeroDivisionError:
             logger.error("Metric OCR: division by zero encountered while checking uterine/umbilical metrics")
@@ -5552,7 +7122,9 @@ def metric_check(df):
             df.loc[df['Word'].str.contains('RI'), 'Value'] = round((PS - ED) / PS, 2)
         if 'TAmax' not in conditions_met:
             # Find TAmax
-            df.loc[df['Word'].str.contains('TAmax'), 'Value'] = round((PS + (2 * ED)) / 3, 2)
+            df.loc[df['Word'].str.contains('TAmax'), 'Value'] = round(
+                tamax_from_ps_ed_approximation(PS, ED), 2
+            )
     else:
         logger.info("Metric OCR: all uterine/umbilical metrics are self-consistent")
 

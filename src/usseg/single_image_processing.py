@@ -59,8 +59,10 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
             If provided, this function will judge file type and load pil_img and cv2_img internally.
 
     Returns:
-        df (pandas dataframe) : Dataframe of extracted text.
-        XYdata (list) : X and Y coordinates of the extracted segmentation.
+        df (pandas dataframe) : Dataframe of extracted text, digitized columns, and
+            ``Returned model`` (raster images only): which segmentation best matched OCR.
+        XYdata (list) : ``[x, y]`` for the selected model (ray, morph, or grow) on raster
+            images after HR time scaling; DICOM path unchanged (primary overlay series).
     """
 
     # Guard invalid input combinations
@@ -176,19 +178,28 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
             top_curve_coords,
             ray_top_curve_mask,
             ray_top_curve_coords,
+            grow_top_curve_mask,
+            grow_top_curve_coords,
         ) = general_functions.segment_refinement(
             cv2_img, Xmin, Xmax, Ymin, Ymax, y_zero=y_zero
         )
-        Xplot, Yplot, Ynought, Xplot_o, Yplot_o = (
-            general_functions.plot_digitized_data_single_axis(
-                Rnumber,
-                Rpositions,
-                Lnumber,
-                Lpositions,
-                top_curve_coords,
-                overlay_curve_coords=ray_top_curve_coords,
-                overlay_is_ray=True,
-            )
+        (
+            Xplot,
+            Yplot,
+            Ynought,
+            Xplot_o,
+            Yplot_o,
+            Xplot_g,
+            Yplot_g,
+        ) = general_functions.plot_digitized_data_single_axis(
+            Rnumber,
+            Rpositions,
+            Lnumber,
+            Lpositions,
+            top_curve_coords,
+            overlay_curve_coords=ray_top_curve_coords,
+            overlay_is_ray=True,
+            grow_curve_coords=grow_top_curve_coords,
         )
 
         if not text_extract_failed:
@@ -199,12 +210,39 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
                     df,
                     Xplot_compare=Xplot,
                     Yplot_compare=Yplot,
+                    Xplot_grow=Xplot_g,
+                    Yplot_grow=Yplot_g,
                 )
             except Exception:
                 logger.exception("Single-image: plot_correction failed")
 
+        # Raster digitized x is [0,1]-style until scaled by HR (matches _Digitized time axis).
+        try:
+            sf, _, _ = general_functions.digitized_hr_scale_factor_for_raster(
+                Xplot_o, Yplot_o, df
+            )
+            if sf != 1.0:
+                Xplot = general_functions.scale_raster_digitized_x(Xplot, sf)
+                Xplot_o = general_functions.scale_raster_digitized_x(Xplot_o, sf)
+                Xplot_g = general_functions.scale_raster_digitized_x(Xplot_g, sf)
+        except Exception:
+            logger.warning(
+                "HR time scaling of digitized x failed; returning arbitrary x",
+                exc_info=True,
+            )
+
+        x_sel, y_sel = general_functions.finalize_image_digitized_model_choice(
+            df,
+            Xplot_o,
+            Yplot_o,
+            Xplot,
+            Yplot,
+            Xplot_g,
+            Yplot_g,
+        )
+
         plt.close("all")
-        return df, [Xplot, Yplot]
+        return df, [x_sel, y_sel]
 
     elif us_dicom:
         # --- DICOM path: metadata dimensions, label text, no axis search, DICOM digitisation + metrics ---
@@ -224,22 +262,39 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
             top_curve_coords,
             ray_top_curve_mask,
             ray_top_curve_coords,
+            grow_top_curve_mask,
+            grow_top_curve_coords,
         ) = general_functions.segment_refinement(
-            cv2_img, Xmin, Xmax, Ymin, Ymax, y_zero=y_zero
+            cv2_img,
+            Xmin,
+            Xmax,
+            Ymin,
+            Ymax,
+            y_zero=y_zero,
+            grow_forbid_yellow=False,
         )
-        Xplot, Yplot, Ynought, Xplot_o, Yplot_o = (
-            general_functions.plot_digitized_data_dicom(
-                dicom_metadata,
-                top_curve_coords=top_curve_coords,
-                overlay_curve_coords=ray_top_curve_coords,
-                overlay_is_ray=True,
-            )
+        (
+            Xplot,
+            Yplot,
+            Ynought,
+            Xplot_o,
+            Yplot_o,
+            Xplot_g,
+            Yplot_g,
+        ) = general_functions.plot_digitized_data_dicom(
+            dicom_metadata,
+            top_curve_coords=top_curve_coords,
+            overlay_curve_coords=ray_top_curve_coords,
+            overlay_is_ray=True,
+            grow_curve_coords=grow_top_curve_coords,
         )
         df = general_functions.waveform_metrics_from_digitized(
             Xplot_o,
             Yplot_o,
             Xplot_compare=Xplot,
             Yplot_compare=Yplot,
+            Xplot_grow=Xplot_g,
+            Yplot_grow=Yplot_g,
         )
 
         if label_result and not df.empty:

@@ -1,0 +1,15 @@
+# Copy this file to `config.toml` and edit to match your local configuration.
+#root_dir = "E:/us-data-demo/0000/" # Root directory to the stored data.
+#output_dir = "E:/us-data-demo/output/"  # Where to save the processed data.
+
+root_dir = "C:/Users/dalek/OneDrive/Documents/SADIE/extracted_images_jpeg/DAPHNE-62/" # Root directory to the stored data.
+output_dir = "C:/Users/dalek/OneDrive/Documents/SADIE/extracted_images_jpeg/DAPHNE-62/output/"  # Where to save the processed data.
+#root_dir = "C:/Users/dalek/OneDrive/Documents/SADIE/questionable_scans/"
+#output_dir = "C:/Users/dalek/OneDrive/Documents/SADIE/questionable_scans/output/"
+#root_dir = "C:/Users/dalek/OneDrive/Documents/SADIE/iTECH_sample/"
+#output_dir = "C:/Users/dalek/OneDrive/Documents/SADIE/iTECH_sample/output/"
+
+[pickle]
+likely_us_images = "likely_us_images.pkl"
+segmented_data = "segmented_data.pkl"
+patient_paths = "patient_paths.pkl"
