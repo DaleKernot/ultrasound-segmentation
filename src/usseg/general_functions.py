@@ -49,6 +49,220 @@ MORPH_LINE_RGBA = (31, 119, 180, 255)
 GROW_CURVE_COLOR = "#b026ff"
 GROW_LINE_RGBA = (176, 38, 255, 255)
 
+# OCR metric label families (order matters: more specific prefixes first).
+METRIC_FAMILY_PREFIXES = (
+    "Lt Ophthalmic",
+    "Rt Ophthalmic",
+    "Lt MCA",
+    "Rt MCA",
+    "Lt Ut",
+    "Rt Ut",
+    "Umb",
+    "DV",
+)
+
+OPHTHALMIC_TARGET_WORDS = [
+    "1 Lt Ophthalmic A. PS",
+    "Lt Ophthalmic A. ED",
+    "Lt Ophthalmic A. PI",
+    "Lt Ophthalmic A. RI",
+    "Lt Ophthalmic A. PS/ED",
+    "Lt Ophthalmic A. ED/PS",
+    "2 Lt Ophthalmic A. PS",
+    "1 Rt Ophthalmic A. PS",
+    "Rt Opthalmic A. ED",
+    "Rt Ophthalmic A. PI",
+    "Rt Ophthalmic A. RI",
+    "Rt Ophthalmic A. PS/ED",
+    "Rt Ophthalmic A. ED/PS",
+    "2 Rt Ophthalmic A. PS",
+]
+
+OPHTHALMIC_TARGET_WORDS_EXTENDED = [
+    "1 Lt Ophthalmic A. PS cm/s",
+    "Lt Ophthalmic A. ED cm/s",
+    "Lt Ophthalmic A. PI",
+    "Lt Ophthalmic A. RI",
+    "Lt Ophthalmic A. PS/ED",
+    "Lt Ophthalmic A. ED/PS",
+    "2 Lt Ophthalmic A. PS cm/s",
+    "1 Rt Ophthalmic A. PS cm/s",
+    "Rt Opthalmic A. ED cm/s",
+    "Rt Ophthalmic A. PI",
+    "Rt Ophthalmic A. RI",
+    "Rt Ophthalmic A. PS/ED",
+    "Rt Ophthalmic A. ED/PS",
+    "2 Rt Ophthalmic A. PS cm/s",
+]
+
+
+def _line_matches_metric_family(line, family):
+    if family == "Lt Ophthalmic":
+        return "Lt Ophthalmic" in line or "Lt Opthalmic" in line
+    if family == "Rt Ophthalmic":
+        return "Rt Ophthalmic" in line or "Rt Opthalmic" in line
+    return family in line
+
+
+def _target_belongs_to_family(word, family):
+    if family == "Lt Ophthalmic":
+        return "Lt Ophthalmic" in word or "Lt Opthalmic" in word
+    if family == "Rt Ophthalmic":
+        return "Rt Ophthalmic" in word or "Rt Opthalmic" in word
+    return word.startswith(family)
+
+
+def _line_looks_ophthalmic(line):
+    ll = line.lower()
+    if any(x in ll for x in ("ophthalmic", "opthalmic", "thaimic", "thamic")):
+        return True
+    return _ophthalmic_metric_kind(line) is not None
+
+
+def _ophthalmic_metric_kind(line):
+    norm = re.sub(r"\s+", "", line.lower())
+    if "ps/ed" in norm:
+        return "PS/ED"
+    if "ed/ps" in norm:
+        return "ED/PS"
+    if re.search(r"a\.?ps$|a\.\s*ps(?:\s|$)", line, re.I) or re.search(r"a\.\s*ps\b", line, re.I):
+        return "PS"
+    if re.search(r"a\.?ed$|a\.\s*ed(?:\s|$)", line, re.I) or re.search(r"a\.\s*ed\b", line, re.I):
+        return "ED"
+    if re.search(r"a\.\s*pi(?:\s|$)", line, re.I) or re.search(r"a\.?pi\b", line, re.I):
+        return "PI"
+    if re.search(r"a\.\s*p[l1](?:\s|$)", line, re.I):
+        return "PI"
+    if re.search(r"a\.\s*ri(?:\s|$)", line, re.I) or re.search(r"a\.?ri\b", line, re.I):
+        return "RI"
+    return None
+
+
+def _detect_ophthalmic_side_from_ocr(ocr_data):
+    texts = [str(t).strip() for t in ocr_data.get("text", []) if t and str(t).strip()]
+    lt = sum(1 for t in texts if t == "Lt")
+    rt = sum(1 for t in texts if t == "Rt")
+    if rt > lt:
+        return "Rt Ophthalmic"
+    return "Lt Ophthalmic"
+
+
+def _detect_metric_family_from_lines(lines, ocr_data=None):
+    counts = {
+        prefix: sum(1 for line in lines if _line_matches_metric_family(line, prefix))
+        for prefix in METRIC_FAMILY_PREFIXES
+    }
+    ophthalmic_count = sum(1 for line in lines if _line_looks_ophthalmic(line))
+    if ophthalmic_count > 0:
+        side = _detect_ophthalmic_side_from_ocr(ocr_data or {})
+        counts[side] = ophthalmic_count
+    best = max(counts.values())
+    if best == 0:
+        return None
+    return max(counts, key=counts.get)
+
+
+def _match_ophthalmic_lines(lines, target_words):
+    """Map OCR lines to ophthalmic target labels by metric suffix and PS order."""
+    df = pd.DataFrame(columns=["Line", "Word", "Value", "Unit"])
+    matched_lines = set()
+    remaining_targets = list(target_words)
+    ps_targets = [
+        w for w in target_words
+        if re.search(r"A\.\s*PS$", w) and "PS/" not in w and "ED/" not in w
+    ]
+    ps_idx = 0
+    value_re = re.compile(r"(\-?\d+(\s*\d+)*\.\s*\d+|\-?\d+(\s*\d+)*)\s*([^\d\s]+)?$")
+
+    def extract_value_unit(line):
+        match = value_re.search(line)
+        if not match:
+            return None, ""
+        return float(match.group(1).replace(" ", "")), (match.group(4) or "")
+
+    def pop_target_for_kind(kind):
+        nonlocal ps_idx
+        if kind == "PS":
+            if ps_idx < len(ps_targets):
+                word = ps_targets[ps_idx]
+                ps_idx += 1
+                return word
+            return next((w for w in remaining_targets if re.search(r"A\.\s*PS$", w) and "PS/" not in w), None)
+        if kind == "PS/ED":
+            return next((w for w in remaining_targets if "PS/ED" in w), None)
+        if kind == "ED/PS":
+            return next((w for w in remaining_targets if "ED/PS" in w), None)
+        if kind == "ED":
+            return next((w for w in remaining_targets if re.search(r"A\.\s*ED$", w)), None)
+        if kind == "PI":
+            return next((w for w in remaining_targets if re.search(r"A\.\s*PI$", w)), None)
+        if kind == "RI":
+            return next((w for w in remaining_targets if re.search(r"A\.\s*RI$", w)), None)
+        return None
+
+    for i, line in enumerate(lines):
+        kind = _ophthalmic_metric_kind(line)
+        if kind is None:
+            continue
+        value, unit = extract_value_unit(line)
+        if value is None:
+            continue
+        word = pop_target_for_kind(kind)
+        if word is None:
+            continue
+        df.loc[len(df)] = {"Line": i + 1, "Word": word, "Value": value, "Unit": unit}
+        if word in remaining_targets:
+            remaining_targets.remove(word)
+        matched_lines.add(i)
+
+    # Attach orphan numeric-only lines (e.g. "20.43 cm/s") to PS rows still at zero.
+    for i, line in enumerate(lines):
+        if i in matched_lines or _ophthalmic_metric_kind(line) is not None:
+            continue
+        value, unit = extract_value_unit(line)
+        if value is None:
+            continue
+        ps_zero = df.index[(df["Word"].isin(ps_targets)) & (df["Value"] == 0)]
+        if len(ps_zero) > 0:
+            row_idx = ps_zero[0]
+            df.loc[row_idx, "Value"] = value
+            if unit:
+                df.loc[row_idx, "Unit"] = unit
+            df.loc[row_idx, "Line"] = i + 1
+            matched_lines.add(i)
+
+    return df, matched_lines, remaining_targets
+
+
+def _is_ophthalmic_df(df):
+    if df is None or df.empty or "Word" not in df.columns:
+        return False
+    words = df["Word"].astype(str)
+    return (
+        words.str.contains("Ophthalmic", na=False).any()
+        or words.str.contains("Opthalmic", na=False).any()
+    )
+
+
+def _df_word_metric_mask(words_series, metric):
+    """Row mask for a metric token; ophthalmic labels need tighter patterns than substring."""
+    if words_series.str.contains("Ophthalmic|Opthalmic", regex=True, na=False).any():
+        patterns = {
+            "PS": r"A\.\s*PS$",
+            "ED": r"A\.\s*ED$",
+            "PI": r"A\.\s*PI$",
+            "RI": r"A\.\s*RI$",
+            "S/D": r"PS/ED$",
+            "PS/ED": r"PS/ED$",
+            "ED/PS": r"ED/PS$",
+            "TA": r"TAmax",
+            "HR": r"HR",
+        }
+        pat = patterns.get(metric, metric)
+        return words_series.str.contains(pat, regex=True, na=False)
+    return words_series.str.contains(metric, na=False)
+
+
 # Foot-based beat detection tuning (used for feet + debug overlays).
 # Defaults chosen to match scratch `mean_wave_test.py`.
 FOOT_SEARCH_FRACTION = 0.50
@@ -2078,14 +2292,14 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
         # Object-based approach: identify tick objects and remove columns with too many overlapping ticks
         # Recompute W from the final ROIAX for consistency
         W_right = (ROIAX > 0).astype(bool)
-        W_right = morphology.remove_small_objects(W_right, max_size=15, connectivity=2)
+        W_right = morphology.remove_small_objects(W_right, max_size=5, connectivity=2) # SAMSUNG - REMOVES TICKS, MAX_SIZE @15 TOO HIGH?
         
         # Label connected components
         labels = measure.label(W_right, connectivity=2)
         props = measure.regionprops(labels)
         
         # Define size thresholds for tick-like objects
-        min_tick_area = 10  # Minimum area for a tick
+        min_tick_area = 5  # Minimum area for a tick
         max_tick_area = 200  # Maximum area for a tick (adjust based on your images)
         max_tick_height = 5  # Maximum height for a tick
         
@@ -5032,15 +5246,25 @@ def plot_correction(
             mean_v = float(np.mean(y))
             TAmax = tamax_from_envelope_temporal_mean(mean_v)
             PI = pulsatility_index_from_ps_ed_and_mean_velocity(PS, ED, mean_v)
-            words = ["PS", "ED", "S/D", "RI", "TA", "PI"]
-            values = [
-                round(PS, 2),
-                round(ED, 2),
-                round(SoverD, 2),
-                round(RI, 2),
-                round(TAmax, 2),
-                round(PI, 2),
-            ]
+            if _is_ophthalmic_df(df):
+                words = ["PS", "ED", "PS/ED", "RI", "PI"]
+                values = [
+                    round(PS, 2),
+                    round(ED, 2),
+                    round(SoverD, 2),
+                    round(RI, 2),
+                    round(PI, 2),
+                ]
+            else:
+                words = ["PS", "ED", "S/D", "RI", "TA", "PI"]
+                values = [
+                    round(PS, 2),
+                    round(ED, 2),
+                    round(SoverD, 2),
+                    round(RI, 2),
+                    round(TAmax, 2),
+                    round(PI, 2),
+                ]
             has_compare = (
                 Xplot_compare is not None
                 and Yplot_compare is not None
@@ -5049,7 +5273,7 @@ def plot_correction(
             )
             for i in range(len(words)):
                 try:
-                    m = df["Word"].str.contains(words[i])
+                    m = _df_word_metric_mask(df["Word"], words[i])
                     df.loc[m, "Digitized Value (ray)"] = values[i]
                 except Exception:
                     continue
@@ -5061,10 +5285,19 @@ def plot_correction(
                     x_c, y_c, hr, arbitrary_period
                 )
                 if vals_compare:
+                    compare_values = vals_compare
+                    if _is_ophthalmic_df(df):
+                        compare_values = [
+                            vals_compare[0],
+                            vals_compare[1],
+                            vals_compare[2],
+                            vals_compare[3],
+                            vals_compare[5],
+                        ]
                     for i in range(len(words)):
                         try:
-                            m = df["Word"].str.contains(words[i])
-                            df.loc[m, "Digitized Value (morph)"] = vals_compare[i]
+                            m = _df_word_metric_mask(df["Word"], words[i])
+                            df.loc[m, "Digitized Value (morph)"] = compare_values[i]
                         except Exception:
                             continue
 
@@ -5081,10 +5314,19 @@ def plot_correction(
                     x_grow, y_grow, hr, arbitrary_period
                 )
                 if vals_grow:
+                    grow_values = vals_grow
+                    if _is_ophthalmic_df(df):
+                        grow_values = [
+                            vals_grow[0],
+                            vals_grow[1],
+                            vals_grow[2],
+                            vals_grow[3],
+                            vals_grow[5],
+                        ]
                     for i in range(len(words)):
                         try:
-                            m = df["Word"].str.contains(words[i])
-                            df.loc[m, "Digitized Value (grow)"] = vals_grow[i]
+                            m = _df_word_metric_mask(df["Word"], words[i])
+                            df.loc[m, "Digitized Value (grow)"] = grow_values[i]
                         except Exception:
                             continue
 
@@ -5785,7 +6027,7 @@ def scan_type_test(input_image_filename):
         "Umb-MD",
         "Umb-TAmax",
         "Umb-HR",
-    ]  # Target words to search for - there may be more to add to this.
+    ] + OPHTHALMIC_TARGET_WORDS
 
     # Split text into lines
     lines = text.split("\n")
@@ -6425,10 +6667,20 @@ def text_from_greyscale(input_image_obj, COL):
         "Rt MCA-MD",
         "Rt MCA-TAmax",
         "Rt MCA-HR",
-    ]
+    ] + OPHTHALMIC_TARGET_WORDS
 
-    # Split text into lines
-    lines = grouped_words  # text.split("\n")
+    # Split text into lines (grouped boxes + full-string fallback for long labels)
+    lines = list(grouped_words)
+    string_lines = [
+        ln.strip()
+        for ln in pytesseract.image_to_string(
+            pixels,
+            lang="eng",
+            config="--oem 1 --psm 3 -c tessedit_char_blacklist=l,!_|=$",
+        ).splitlines()
+        if ln.strip()
+    ]
+    combined_lines = string_lines + [ln for ln in lines if ln not in string_lines]
 
     def refine_hr_from_local_roi(df_in, lines_in, bboxes_in, col_img):
         """Re-read HR from a local ROI around the first-pass HR line.
@@ -6533,59 +6785,33 @@ def text_from_greyscale(input_image_obj, COL):
     # Initialize DataFrame
     df = pd.DataFrame(columns=["Line", "Word", "Value", "Unit"])
 
-    prefixes = ["Lt Ut", "Rt Ut", "Umb", "DV","Rt MCA","Lt MCA"]
-    prefix_counts = {prefix: sum(1 for line in lines if prefix in line) for prefix in prefixes}
-    most_likely_prefix = max(prefix_counts, key=prefix_counts.get)
+    most_likely_prefix = _detect_metric_family_from_lines(combined_lines, data)
+    if most_likely_prefix is not None:
+        target_words = [word for word in target_words if _target_belongs_to_family(word, most_likely_prefix)]
+        word_order = list(target_words)
+    else:
+        word_order = list(target_words)
+        logger.warning(
+            "Metric OCR: could not detect vessel family from OCR lines; "
+            "using full target word list."
+        )
 
-    # Filter target words based on the most likely prefix
-    target_words = [word for word in target_words if word.startswith(most_likely_prefix)]
-    word_order = [word for word in target_words if word.startswith(most_likely_prefix)]
+    match_lines = combined_lines
+    matched_lines = set()
 
-    # Step 1: Exact matching
-    matched_lines = set()  # to store the indices of lines that have been matched
-
-    for i, line in enumerate(lines):
-        for word in target_words:
-            if word in line:  # checking for exact match
-                # Extract value and unit
-                match = re.search(r"(\-?\d+(\s*\d+)*\.\s*\d+|\-?\d+(\s*\d+)*)\s*([^\d\s]+)?$", line)
-
-                if match:
-                    value = float(match.group(1).replace(' ', ''))
-                    unit = match.group(4) if match.group(4) else ""
-                    df.loc[len(df)] = {"Line": i + 1, "Word": word, "Value": value, "Unit": unit}
-                    target_words.remove(word)
-                else:
-                    # logger.warning("couldn't find numeric data for line.")
-                    df.loc[len(df)] = {"Line": i + 1, "Word": word, "Value": 0, "Unit": 0}
-                    target_words.remove(word)
-                matched_lines.add(i)
-                break  # Exit the inner loop once a match is found
-
-    def is_subsequence(target, line):
-        target_idx = 0
-        line_idx = 0
-
-        # Filter out spaces and hyphens from target
-        filtered_target = [char for char in target if char not in [' ', '-']]
-
-        while target_idx < len(filtered_target) and line_idx < len(line):
-            if filtered_target[target_idx].lower() == line[line_idx].lower():
-                target_idx += 1
-            line_idx += 1
-
-        return target_idx == len(filtered_target)
-
-    # Step 2: Subsequence matching for unmatched lines
-    for i, line in enumerate(lines):
-        if i not in matched_lines:  # only process unmatched lines
+    if most_likely_prefix in ("Lt Ophthalmic", "Rt Ophthalmic"):
+        df, matched_lines, target_words = _match_ophthalmic_lines(match_lines, target_words)
+    else:
+        # Step 1: Exact matching
+        for i, line in enumerate(match_lines):
             for word in target_words:
-                if is_subsequence(word, line):
+                if word in line:  # checking for exact match
                     # Extract value and unit
-                    match = re.search(r"(\-?\d+\.\d+|\-?\d+)\s*([^\d\s]+)?$", line)
+                    match = re.search(r"(\-?\d+(\s*\d+)*\.\s*\d+|\-?\d+(\s*\d+)*)\s*([^\d\s]+)?$", line)
+
                     if match:
-                        value = float(match.group(1))
-                        unit = match.group(2) if match.group(2) else ""
+                        value = float(match.group(1).replace(' ', ''))
+                        unit = match.group(4) if match.group(4) else ""
                         df.loc[len(df)] = {"Line": i + 1, "Word": word, "Value": value, "Unit": unit}
                         target_words.remove(word)
                     else:
@@ -6595,51 +6821,83 @@ def text_from_greyscale(input_image_obj, COL):
                     matched_lines.add(i)
                     break  # Exit the inner loop once a match is found
 
-    # If no line matched any target word exactly (distance == 0), flag it – this
-    # is a strong indicator that the prefix matching is off for this scan.
-    if not matched_lines:
-        logger.warning(
-            "Metric OCR: no exact prefix matches between OCR lines and target words; "
-            "metric labels may be misaligned."
-        )
+    if most_likely_prefix not in ("Lt Ophthalmic", "Rt Ophthalmic"):
+        def is_subsequence(target, line):
+            target_idx = 0
+            line_idx = 0
 
-    def find_closest_target(line, target_words):
-        min_distance = float('inf')
-        closest_word = None
+            # Filter out spaces and hyphens from target
+            filtered_target = [char for char in target if char not in [' ', '-']]
 
-        for word in target_words:
-            # Compare only the prefix of the line up to the target word length,
-            # so trailing numbers/units (e.g. " — 27.35cm/s") do not affect
-            # the distance. Case and characters are preserved.
-            candidate = line[: len(word)]
-            distance = Levenshtein.distance(candidate, word)
-            if distance < min_distance:
-                min_distance = distance
-                closest_word = word
+            while target_idx < len(filtered_target) and line_idx < len(line):
+                if filtered_target[target_idx].lower() == line[line_idx].lower():
+                    target_idx += 1
+                line_idx += 1
 
-        return closest_word, min_distance
+            return target_idx == len(filtered_target)
 
-    # Set a threshold for acceptable similarity
-    threshold = 7
+        # Step 2: Subsequence matching for unmatched lines
+        for i, line in enumerate(match_lines):
+            if i not in matched_lines:  # only process unmatched lines
+                for word in target_words:
+                    if is_subsequence(word, line):
+                        # Extract value and unit
+                        match = re.search(r"(\-?\d+\.\d+|\-?\d+)\s*([^\d\s]+)?$", line)
+                        if match:
+                            value = float(match.group(1))
+                            unit = match.group(2) if match.group(2) else ""
+                            df.loc[len(df)] = {"Line": i + 1, "Word": word, "Value": value, "Unit": unit}
+                            target_words.remove(word)
+                        else:
+                            # logger.warning("couldn't find numeric data for line.")
+                            df.loc[len(df)] = {"Line": i + 1, "Word": word, "Value": 0, "Unit": 0}
+                            target_words.remove(word)
+                        matched_lines.add(i)
+                        break  # Exit the inner loop once a match is found
 
-    # Step 3: Closest target word matching for unmatched lines
-    for i, line in enumerate(lines):
-        if i not in matched_lines:  # only process unmatched lines
-            closest_word, distance = find_closest_target(line, target_words)
+        # If no line matched any target word exactly (distance == 0), flag it – this
+        # is a strong indicator that the prefix matching is off for this scan.
+        if not matched_lines:
+            logger.warning(
+                "Metric OCR: no exact prefix matches between OCR lines and target words; "
+                "metric labels may be misaligned."
+            )
 
-            if distance <= threshold:
-                # Extract value and unit
-                match = re.search(r"(\-?\d+(\s*\d+)*\.\s*\d+|\-?\d+(\s*\d+)*)\s*([^\d\s]+)?$", line)
-                if match:
-                    value = float(match.group(1).replace(' ', ''))
-                    unit = match.group(4) if match.group(4) else ""
-                    df.loc[len(df)] = {"Line": i + 1, "Word": closest_word, "Value": value, "Unit": unit}
-                    target_words.remove(closest_word)
-                matched_lines.add(i)
+        def find_closest_target(line, target_words):
+            min_distance = float('inf')
+            closest_word = None
 
+            for word in target_words:
+                # Compare only the prefix of the line up to the target word length,
+                # so trailing numbers/units (e.g. " — 27.35cm/s") do not affect
+                # the distance. Case and characters are preserved.
+                candidate = line[: len(word)]
+                distance = Levenshtein.distance(candidate, word)
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_word = word
 
+            return closest_word, min_distance
 
-    target_words_extended = [
+        # Set a threshold for acceptable similarity
+        threshold = 7
+
+        # Step 3: Closest target word matching for unmatched lines
+        for i, line in enumerate(match_lines):
+            if i not in matched_lines:  # only process unmatched lines
+                closest_word, distance = find_closest_target(line, target_words)
+
+                if distance <= threshold:
+                    # Extract value and unit
+                    match = re.search(r"(\-?\d+(\s*\d+)*\.\s*\d+|\-?\d+(\s*\d+)*)\s*([^\d\s]+)?$", line)
+                    if match:
+                        value = float(match.group(1).replace(' ', ''))
+                        unit = match.group(4) if match.group(4) else ""
+                        df.loc[len(df)] = {"Line": i + 1, "Word": closest_word, "Value": value, "Unit": unit}
+                        target_words.remove(closest_word)
+                    matched_lines.add(i)
+
+        target_words_extended = [
         "Lt Ut-PS cm/s",
         "Lt Ut-ED cm/s",
         "Lt Ut-S/D",
@@ -6674,72 +6932,79 @@ def text_from_greyscale(input_image_obj, COL):
         "DV-PLI",
         "DV-PVIV",
         "DV-HR bpm",
-    ]
+        ] + OPHTHALMIC_TARGET_WORDS_EXTENDED
 
-    if target_words:
+        if target_words:
 
-        suffixes = [word.split('-')[-1] for word in target_words if '-' in word]
-        indices = [i for i, entry in enumerate(target_words_extended) if any(sub in entry for sub in target_words)]
-        remaining_target_extended = [target_words_extended[i] for i in indices]
+            indices = [i for i, entry in enumerate(target_words_extended) if any(sub in entry for sub in target_words)]
+            remaining_target_extended = [target_words_extended[i] for i in indices]
+            remaining_target_words = []
+            for entry in remaining_target_extended:
+                matched_tw = next((tw for tw in target_words if tw in entry), None)
+                if matched_tw is None:
+                    matched_tw = target_words[min(len(remaining_target_words), len(target_words) - 1)]
+                remaining_target_words.append(matched_tw)
 
-        # Create a distance matrix
-        num_lines = len(lines)
-        num_target_words = len(remaining_target_extended)
-        distance_matrix = np.zeros((num_lines, num_target_words))
+            def _metric_suffix_for_fuzzy(word):
+                if "-" in word:
+                    return word.split("-")[-1]
+                m = re.search(r"A\.\s*(\S+)", word)
+                if m:
+                    return m.group(1)
+                return word.split()[-1]
 
-        # Bias values - these need to be defined by you, for example:
-        # Create a list of bias values, all set to -2, with the same length as suffixes
-        bias_values = [-2] * len(suffixes)  # Creates a list with -2 repeated len(suffixes) times
+            suffixes = [_metric_suffix_for_fuzzy(word) for word in remaining_target_extended]
+            bias_dict = {suffix: -2 for suffix in suffixes}
 
-        # Bias dictionary, where the keys are suffixes and the values are the bias amounts
-        bias_dict = {suffix: bias for suffix, bias in zip(suffixes, bias_values)}
+            # Create a distance matrix
+            num_lines = len(match_lines)
+            num_target_words = len(remaining_target_extended)
+            distance_matrix = np.zeros((num_lines, num_target_words))
 
-        # Initialize your distance matrix
-        num_lines = len(lines)
-        num_target_words = len(remaining_target_extended)
-        distance_matrix = np.zeros((num_lines, num_target_words))
+            # Calculate biased distances
+            for i, line in enumerate(match_lines):
+                if i not in matched_lines:
+                    for j, word in enumerate(remaining_target_extended):
+                        # Remove digits from the line
+                        line_no_digits = re.sub(r'\d+', '', line)
 
-        # Calculate biased distances
-        for i, line in enumerate(lines):
-            if i not in matched_lines:
-                for j, word in enumerate(remaining_target_extended):
-                    # Remove digits from the line
-                    line_no_digits = re.sub(r'\d+', '', line)
+                        # Calculate basic Levenshtein distance
+                        basic_distance = Levenshtein.distance(line_no_digits, word)
 
-                    # Calculate basic Levenshtein distance
-                    basic_distance = Levenshtein.distance(line_no_digits, word)
+                        # Apply bias if a specific suffix is expected in the line
+                        expected_suffix = suffixes[j]
+                        if expected_suffix in line:
+                            basic_distance += bias_dict[expected_suffix]
 
-                    # Apply bias if a specific suffix is expected in the line
-                    expected_suffix = suffixes[j]  # Suffix that corresponds to the current target word
-                    if expected_suffix in line:
-                        # Subtract bias to reduce distance
-                        basic_distance += bias_dict[expected_suffix]
+                        # Set the biased distance in the matrix
+                        distance_matrix[i, j] = basic_distance
 
-                    # Set the biased distance in the matrix
-                    distance_matrix[i, j] = basic_distance
+            matches = {}
+            for j, word in enumerate(remaining_target_extended):
+                # Find the line with the smallest non-zero distance for the current target word
+                line_indices_with_non_zero_distances = np.where(distance_matrix[:, j] > 0)[0]
+                if len(line_indices_with_non_zero_distances) > 0:
+                    i = line_indices_with_non_zero_distances[np.argmin(distance_matrix[line_indices_with_non_zero_distances, j])]
+                    line = match_lines[i]
+                    # Add to matches
+                    matches[line] = word
 
-        matches = {}
-        for j, word in enumerate(remaining_target_extended):
-            # Find the line with the smallest non-zero distance for the current target word
-            line_indices_with_non_zero_distances = np.where(distance_matrix[:, j] > 0)[0]
-            if len(line_indices_with_non_zero_distances) > 0:
-                i = line_indices_with_non_zero_distances[np.argmin(distance_matrix[line_indices_with_non_zero_distances, j])]
-                line = lines[i]
-                # Add to matches
-                matches[line] = word
+                    # Extract value and unit from the line and add to the DataFrame
+                    match = re.search(r"(\-?\d+(\s*\d+)*\.\s*\d+|\-?\d+(\s*\d+)*)\s*([^\d\s]+)?$", line)
+                    if match:
+                        value = float(match.group(1).replace(' ', ''))
+                        unit = match.group(4) if match.group(4) else ""
+                        df.loc[len(df)] = {"Line": i + 1, "Word": remaining_target_words[j], "Value": value, "Unit": unit}
+                    else:
+                        df.loc[len(df)] = {"Line": i + 1, "Word": remaining_target_words[j], "Value": 0, "Unit": 0}
+                    matched_lines.add(i)
 
-                # Extract value and unit from the line and add to the DataFrame
-                match = re.search(r"(\-?\d+(\s*\d+)*\.\s*\d+|\-?\d+(\s*\d+)*)\s*([^\d\s]+)?$", line)
-                if match:
-                    value = float(match.group(1).replace(' ', ''))
-                    unit = match.group(4) if match.group(4) else ""
-                    df.loc[len(df)] = {"Line": i + 1, "Word": target_words[j], "Value": value, "Unit": unit}
-                else:
-                    df.loc[len(df)] = {"Line": i + 1, "Word": target_words[j], "Value": 0, "Unit": 0}
-                matched_lines.add(i)
-
-                # Remove the matched line from further consideration
-                distance_matrix[i, :] = np.inf
+                    # Remove the matched line from further consideration
+                    distance_matrix[i, :] = np.inf
+    elif most_likely_prefix in ("Lt Ophthalmic", "Rt Ophthalmic") and not matched_lines:
+        logger.warning(
+            "Metric OCR: ophthalmic family detected but no metric lines matched."
+        )
 
     # Create a mask for each word in the word_order list and concatenate them in order
     df = pd.concat([df.loc[df['Word'] == word] for word in word_order]).reset_index(drop=True)
@@ -6765,7 +7030,9 @@ def text_from_greyscale(input_image_obj, COL):
                 df.loc[df['Word'] == 'DV-a', 'Unit'] = temp_unit
 
             df = metric_check_dv(df)  # handle the ductus venousus differently
-        else:
+        elif most_likely_prefix in ("Lt Ophthalmic", "Rt Ophthalmic"):
+            df = metric_check_ophthalmic(df)
+        elif most_likely_prefix is not None:
             df = metric_check(df)  # for left, right, and umbilical
     except Exception:
         logger.exception("Metric check failed for uterine/umbilical metrics")
@@ -6781,6 +7048,71 @@ def text_from_greyscale(input_image_obj, COL):
         df.loc[hr_mask, 'Value'] = df.loc[hr_mask, 'Value'].abs()
 
     return Fail, df
+
+
+def metric_check_ophthalmic(df):
+    """Validate and lightly correct ophthalmic artery OCR metrics (PS, ED, PI, RI, PS/ED)."""
+    if "Raw Value" not in df.columns:
+        df["Raw Value"] = df["Value"].copy()
+
+    words = df["Word"]
+
+    def get_val(metric):
+        mask = _df_word_metric_mask(words, metric)
+        if mask.any():
+            return float(df.loc[mask, "Value"].values[0])
+        return None
+
+    def set_val(metric, val):
+        mask = _df_word_metric_mask(words, metric)
+        if mask.any():
+            df.loc[mask, "Value"] = val
+
+    pi = get_val("PI")
+    if pi is not None:
+        set_val("PI", check_pi_value(pi))
+
+    ps = get_val("PS")
+    ed = get_val("ED")
+    if ps is None and ed is None:
+        return df
+
+    ps = ps if ps is not None else 0.0
+    ed = ed if ed is not None else 0.0
+
+    if 250 <= ps <= 1000:
+        ps = ps / 10
+    if 1000 <= ps <= 10000:
+        ps = ps / 100
+    if 200 <= ed <= 1000:
+        ed = ed / 10
+    if 1000 <= ed <= 10000:
+        ed = ed / 100
+
+    set_val("PS", ps)
+    set_val("ED", ed)
+
+    if ed == 0:
+        ed = float(np.finfo(float).eps)
+
+    ratio_calc = ps / ed
+    ri_calc = resistive_index_from_ps_ed(ps, ed)
+
+    ratio_extracted = get_val("PS/ED")
+    if ratio_extracted is None:
+        ratio_extracted = get_val("S/D")
+    ri_extracted = get_val("RI")
+
+    if ratio_extracted is None or abs(ratio_calc - ratio_extracted) > 0.5:
+        if _df_word_metric_mask(words, "PS/ED").any():
+            set_val("PS/ED", round(ratio_calc, 2))
+        elif _df_word_metric_mask(words, "ED/PS").any() and ratio_calc != 0:
+            set_val("ED/PS", round(1.0 / ratio_calc, 2))
+
+    if ri_extracted is None or abs(ri_calc - ri_extracted) > 0.1:
+        set_val("RI", round(ri_calc, 2))
+
+    return df
 
 
 def metric_check(df):
@@ -6849,11 +7181,23 @@ def metric_check(df):
             "Rt MCA-MD",
             "Rt MCA-TAmax",
             "Rt MCA-HR",
-        ]
-        valid_prefixes = ["Lt Ut", "Rt Ut", "Umb", "Lt MCA", "Rt MCA"]
+        ] + OPHTHALMIC_TARGET_WORDS
+        valid_prefixes = ["Lt Ut", "Rt Ut", "Umb", "Lt MCA", "Rt MCA", "Lt Ophthalmic", "Rt Ophthalmic"]
         prf = None
         for prefix in valid_prefixes:
-            if lines["Word"].str.contains(prefix, regex=False).any():
+            if prefix in ("Lt Ophthalmic", "Rt Ophthalmic"):
+                if lines["Word"].astype(str).str.contains("Ophthalmic|Opthalmic", regex=True, na=False).any():
+                    if prefix == "Lt Ophthalmic" and (
+                        lines["Word"].astype(str).str.contains("Lt Ophthalmic|Lt Opthalmic", regex=True, na=False).any()
+                    ):
+                        prf = prefix
+                        break
+                    if prefix == "Rt Ophthalmic" and (
+                        lines["Word"].astype(str).str.contains("Rt Ophthalmic|Rt Opthalmic", regex=True, na=False).any()
+                    ):
+                        prf = prefix
+                        break
+            elif lines["Word"].str.contains(prefix, regex=False).any():
                 prf = prefix
                 break
 
@@ -6862,7 +7206,7 @@ def metric_check(df):
             return None, []
 
         logger.info("metric_check: metric prefix detected %s", prf)
-        filtered_target_words = [word for word in target_words if word.startswith(prf)]
+        filtered_target_words = [word for word in target_words if _target_belongs_to_family(word, prf)]
         return prf, filtered_target_words
 
     def add_missing_rows(df_in):

@@ -38,7 +38,7 @@ def check_file_for_us(file_path):
             Fail, df = general_functions.scan_type_test(file_path)
             if Fail == 0:
                 # Extract patient ID from the file path
-                match = re.search(r"\d{4}", file_path)
+                match = re.search(r"\d{3}", file_path)
                 if match:
                     patient_id = match.group(0)
                     return patient_id, file_path
@@ -47,7 +47,7 @@ def check_file_for_us(file_path):
     return None
 
 
-def get_likely_us(root_dir, pickle_path=None, use_parallel=True):
+def get_likely_us(root_dir, pickle_path=None, use_parallel=False):
     """Searches a directory and identifies the images that are likely to be doppler ultrasounds.
 
     Args:

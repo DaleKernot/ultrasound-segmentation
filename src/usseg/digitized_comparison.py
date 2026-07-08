@@ -29,7 +29,7 @@ def metric_kind_for_digitized_row(word: object) -> str:
     on stripped tokens.
     """
     s = str(word if word is not None else "").strip().upper()
-    if "S/D" in s:
+    if "PS/ED" in s or "ED/PS" in s or "S/D" in s:
         return "ratio"
     if "TA" in s:
         return "velocity"
