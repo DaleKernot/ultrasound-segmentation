@@ -12,23 +12,84 @@ These codes make up the framework for segmenting the doppler ultrasound scans.
 
 ## Installation
 
-- To install as a dependency for your project:
-
-``` 
-pip install usseg
-```
+This repository is not currently set up as a command-line application, and the
+published `pip install usseg` package may not match the current development
+version of this codebase. For local use, install from this repository instead.
 
 ### Development Environment
 
-To install the development environment follow the following steps.
+1. Clone this repository and change into the repository directory.
 
-- Clone this repository and change into the directory.
-- Install [tesseract](https://github.com/tesseract-ocr/tesseract) as per the intallation instructions.
-    - Note that the project has only been tested with tesseract version 5.
-- Install the package dependencies with:
+```bash
+git clone https://github.com/SADIE-digital-environments/ultrasound-segmentation.git
+cd ultrasound-segmentation
 ```
-pip install .
 
+2. Create and activate a Python environment. Python 3.9 or newer is recommended.
+
+```bash
+python -m venv .venv
+```
+
+On Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+On macOS/Linux:
+
+```bash
+source .venv/bin/activate
+```
+
+3. Install [Tesseract OCR](https://github.com/tesseract-ocr/tesseract). The project has mainly been tested with Tesseract 5. On Windows, the code expects
+the executable at:
+
+```text
+C:/Program Files/Tesseract-OCR/tesseract.exe
+```
+
+4. Install the package from the local checkout.
+
+For active development:
+
+```bash
+pip install -e .
+```
+
+For a normal local install:
+
+```bash
+pip install .
+```
+
+5. Create a local configuration file.
+
+```bash
+cp config_example.toml config.toml
+```
+
+On Windows PowerShell:
+
+```powershell
+Copy-Item config_example.toml config.toml
+```
+
+Edit `config.toml` so that `root_dir` points to the folder or file to process,
+and `output_dir` points to the folder where processed images should be written.
+The `[pickle]` section controls the filenames used for intermediate results.
+
+Example:
+
+```toml
+root_dir = "E:/test-data"
+output_dir = "E:/test-data-processed/"
+
+[pickle]
+likely_us_images = "likely_us_images.pkl"
+segmented_data = "segmented_data.pkl"
+patient_paths = "patient_paths.pkl"
 ```
 
 # Ultrasound Segmentation Package
@@ -96,33 +157,46 @@ Some common usage examples include segmenting a single image, or processing a ba
 
 ### Processing a Single Image
 
-For processing a single image, the `data_from_image` function is imported and provided with PIL and cv2 versions of the image. This could be done through the following code:
+For processing a single image, import `data_from_image` and provide the image
+path. This is the preferred current API:
 
 ```python
-# Module imports
-import numpy as np
-from PIL import Image
-
-# Local imports
 from usseg import data_from_image
 
 img_path = "Path/to/a/ultrasound/image.JPG"
 
-PIL_image = Image.open(img_path)
-cv2_image = np.array(PIL_image)
-df, (xdata, ydata) = data_from_image(PIL_image, cv2_image)
+df, (xdata, ydata) = data_from_image(image_path=img_path)
 ```
-Alternatively, the single image processing script within the tests folder can be modified for 
-any given input image.
+
+The legacy form that passes pre-loaded PIL and cv2 images is still supported
+temporarily, but new code should prefer `image_path`.
+
+For a working example, see `tests/single_image_processing_test.py`. This test
+file shows how to call `data_from_image` on a single image and can be adapted
+when checking a new input scan locally.
 
 ### Batch processing images
 
-For processing groups of images, the usseg.main module can be used. This module is designed 
-to process a series of images contained in a folder and save to specified location, defined in the config.toml. 
-A visualisation file output.html is generated for evaluation the data extraction. This can be done through:
-```python
-python usseg/main.py
+For processing groups of images, configure `config.toml` and run the main module
+from the repository root:
+
+```bash
+python -m usseg.main
 ```
+
+The batch workflow:
+
+1. Reads `root_dir` from `config.toml`.
+2. Searches for likely ultrasound files. Current discovery includes `.jpg`,
+   `.png`, `.dcm`, and `.dicom` files.
+3. Saves the discovered paths to the pickle file configured as
+   `pickle.likely_us_images`.
+4. Segments and digitises the selected scans.
+5. Writes processed images to `output_dir`.
+6. Saves segmentation results to the pickle file configured as
+   `pickle.segmented_data`.
+7. Generates `generated_segmented_data.html` for visual inspection of the
+   extracted data and segmentation outputs.
 
 ## Limitation and future work
 

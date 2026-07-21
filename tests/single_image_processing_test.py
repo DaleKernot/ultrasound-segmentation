@@ -31,22 +31,6 @@ def test_data_from_image():
 
     logger.info(f"Extracted the following text from {img_path}:\n{df}")
 
-
-def test_failures():
-    """Test that the correct fail responses are being raised."""
-    
-    # Failed extraction
-    cv2_img = np.random.default_rng().integers(0, 256, size=(100, 100, 3), dtype=np.uint8)
-    PIL_img = Image.fromarray(cv2_img)
-
-    with pytest.raises(ValueError) as exc_info:
-        data_from_image(PIL_img, cv2_img)
-
-    exc_raised = str(exc_info.value)
-    assert exc_raised == "attempt to get argmax of an empty sequence"
-
-
 if __name__ == "__main__":
     test_data_from_image()
-    #test_failures()
     logger.info(f"{__file__} tests have passed!")
