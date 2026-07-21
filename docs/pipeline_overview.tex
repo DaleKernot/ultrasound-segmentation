@@ -1,0 +1,79 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{siunitx}
+
+\title{Doppler Ultrasound Segmentation and Metric Extraction Pipeline}
+\author{Your Name}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Introduction}
+  \subsection{Motivation and clinical context}
+  \subsection{Scope of this document}
+  \subsection{Codebase overview}
+    % High-level: usseg.main, organise_files, general_functions, segment_files, visualisation_html
+
+\section{Data Inputs and Organisation}
+  \subsection{Supported modalities and file formats}
+  \subsection{Directory structure and configuration}
+  \subsection{Patient grouping and file discovery}
+
+\section{Preprocessing and Scan Selection}
+  \subsection{Scan type detection}
+  \subsection{Colour and intensity preprocessing}
+  \subsection{Tesseract configuration}
+
+\section{Text Extraction and OCR Repair}
+  \subsection{Metric panel localisation}
+  \subsection{Primary OCR pass}
+  \subsection{Target label sets}
+  \subsection{Label matching algorithms}
+    \subsubsection{Exact and subsequence matching}
+    \subsubsection{Levenshtein-based fuzzy matching}
+    \subsubsection{Ophthalmic-specific matching}
+  \subsection{Heart rate refinement}
+  \subsection{Metric consistency checks}
+
+\section{Image Segmentation and Axis Detection}
+  \subsection{Initial segmentation of Doppler region}
+  \subsection{Axis and tick detection}
+  \subsection{Handling invalid or incomplete axes}
+
+\section{Waveform Digitization}
+  \subsection{Ray, morphology, and grow models}
+  \subsection{Beat detection and foot-based segmentation}
+  \subsection{Time-axis calibration}
+  \subsection{Hemodynamic indices}
+
+\section{Digitized vs OCR Metric Comparison}
+  \subsection{Metric mapping into the text table}
+  \subsection{Traffic-light scoring}
+  \subsection{Model selection}
+
+\section{Outputs}
+  \subsection{Pickle artifacts}
+  \subsection{HTML report generation}
+  \subsection{Known failure modes and limitations}
+
+\section{Implementation Notes}
+  \subsection{Key modules and entry points}
+  \subsection{Performance considerations}
+  \subsection{Testing}
+
+\section{Future Work}
+  \subsection{Potential algorithmic improvements}
+  \subsection{Planned refactors or extensions}
+
+\bibliographystyle{plain}
+\bibliography{references} % optional
+
+\end{document}
+

@@ -16,9 +16,8 @@ logger = logging.getLogger(__file__)
 
 def test_data_from_image():
     """Test the data_from_image function."""
-    img_path = "C:/Users/dalek/OneDrive/Documents/SADIE/questionable_scans/DAPHNE-10_20220812_0_66f0edfa.JPG"
-    #"C:/Users/dalek/OneDrive/Documents/SADIE/questionable_scans/DAPHNE-10_20220812_0_66f0edfa.JPG"
-    #"C:/Users/dalek/OneDrive/Documents/SADIE/questionable_scans/DAPHNE-12_20221019_0_a7ad076f.jpg"
+    img_path = "tests/test_images/test_image_1.jpg"
+
 
     #PIL_image = Image.open(img_path)
     #cv2_image = np.array(PIL_image)
