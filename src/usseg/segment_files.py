@@ -234,7 +234,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                     Lnumber, Lpositions, side="Left"
                 )
             except Exception:
-                traceback.print_exc()  # prints the error message and traceback
+                #traceback.print_exc()  # prints the error message and traceback
                 logger.error("Failed Left Axes search")
 
                 Fail = Fail + 1
@@ -276,7 +276,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                     Rnumber, Rpositions, side="Right"
                 )
             except Exception:
-                traceback.print_exc()  # prints the error message and traceback
+                #traceback.print_exc()  # prints the error message and traceback
                 logger.error("Failed Right Axes search")
 
                 Fail = Fail + 1
@@ -337,7 +337,7 @@ def segment(filenames=None, output_dir=None, pickle_path=None):
                     grow_forbid_yellow=not us_dicom,
                 )
             except Exception:
-                traceback.print_exc()  # prints the error message and traceback
+                #traceback.print_exc()  # prints the error message and traceback
                 logger.error("Failed Segment refinement")
                 Fail = Fail + 1
                 pass

@@ -675,7 +675,7 @@ def _shrink_seed_for_region_grow(refined_bool, allowed_bool, erosion_radius: int
     if erosion_radius <= 0:
         return fallback
     foot = morphology.disk(int(erosion_radius))
-    eroded = morphology.binary_erosion(refined_bool, footprint=foot)
+    eroded = morphology.erosion(refined_bool, footprint=foot)
     shrunk = eroded & allowed_bool
     if not np.any(shrunk):
         logger.warning(
