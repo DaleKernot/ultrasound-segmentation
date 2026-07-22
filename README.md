@@ -171,9 +171,9 @@ df, (xdata, ydata) = data_from_image(image_path=img_path)
 The legacy form that passes pre-loaded PIL and cv2 images is still supported
 temporarily, but new code should prefer `image_path`.
 
-For a working example, see `tests/single_image_processing_test.py`. This test
-file shows how to call `data_from_image` on a single image and can be adapted
-when checking a new input scan locally.
+For an example script, see `tests/single_image_processing_test.py`. The image
+path in that file is a placeholder; replace it with the path to a local scan
+before running the test.
 
 ### Batch processing images
 
