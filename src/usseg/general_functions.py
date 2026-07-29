@@ -46,6 +46,7 @@ logger = logging.getLogger(__file__)
 # Matplotlib tab blue for morph tracing; PIL RGBA for annotated polylines (replacing cyan).
 MORPH_CURVE_COLOR = "#1f77b4"
 MORPH_LINE_RGBA = (31, 119, 180, 255)
+RAY_CURVE_COLOR = "#d62728"
 GROW_CURVE_COLOR = "#b026ff"
 GROW_LINE_RGBA = (176, 38, 255, 255)
 
@@ -276,8 +277,12 @@ FOOT_DERIV_EDGE_GUARD = 2
 USE_SQI_FILTER = False
 # Keep saved Figure 2 clean by default (used in HTML output).
 SHOW_BEAT_DEBUG_SUBPLOTS = False
-# Region-grow: matplotlib debug (full-image trace + 3 ROI pipeline figures); not saved to batch.
-SHOW_GROW_DEBUG_PLOTS = False
+# Region-grow: main-steps figure (+ optional detailed pipeline); not saved to batch.
+SHOW_GROW_DEBUG_PLOTS = True
+# Morphological method: refined-mask stages + Method-1 envelope overlay.
+SHOW_MORPH_DEBUG_PLOTS = True
+# Ray tracing: Method-2 main-steps figure (k-means → yellow → picks → smooth).
+SHOW_RAY_DEBUG_PLOTS = True
 # Disk radius (pixels) for binary erosion of the refined mask before region-grow.
 # 0 disables. Shrinking the seed avoids over-thick refined blobs dominating seed
 # statistics and lets growth fill troughs; if erosion removes all seeds, the
@@ -1290,11 +1295,422 @@ def _plot_region_grow_pipeline_debug(
     fig_prof.tight_layout(rect=[0, 0.08, 1, 0.94])
 
 
-def _morphological_top_curve_from_mask(mask_in, Ymin, Ymax, y_zero=None):
+def _morph_roi_slices(h, w, Xmin, Xmax, Ymin, Ymax, roi_pad=24):
+    """ROI crop slices matching refine / grow debug framing (Ymin-50 top margin)."""
+    x0 = max(0, int(Xmin) - 1 - roi_pad)
+    x1 = min(w, int(Xmax) + roi_pad)
+    y0 = max(0, int(Ymin) - 50 - roi_pad)
+    y1 = min(h, int(Ymax) + roi_pad)
+    x1 = max(x1, x0 + 2)
+    y1 = max(y1, y0 + 2)
+    return slice(y0, y1), slice(x0, x1), y0, y1, x0, x1
+
+
+def _plot_morph_refine_debug(input_image_bgr, stages, Xmin, Xmax, Ymin, Ymax, roi_pad=24):
+    """
+    Morph refine pipeline stages (pipeline_overview Stage 4 /
+    ``refine_waveform_segmentation``). One 2×4 ROI-cropped figure.
+    """
+    gray = stages.get("gray")
+    if gray is None:
+        return
+    h, w = gray.shape[:2]
+    sl_y, sl_x, y0, y1, x0, x1 = _morph_roi_slices(
+        h, w, Xmin, Xmax, Ymin, Ymax, roi_pad=roi_pad
+    )
+
+    def crop(a):
+        arr = np.asarray(a)
+        if arr.ndim == 2:
+            return arr[sl_y, sl_x]
+        return arr[sl_y, sl_x, ...]
+
+    rgb = cv2.cvtColor(np.asarray(input_image_bgr), cv2.COLOR_BGR2RGB)
+
+    titles = [
+        "RGB (ROI)",
+        "Greyscale",
+        "Threshold @ 30",
+        "ROI cropped (Ymin−50)",
+        "Clean: rm small / holes / 2×erode / dilate",
+        "Close + holes999 + median 3×3",
+        "After CC filter (keep large)",
+        "Final (Gaussian σ=7 → >0.5)",
+    ]
+    arrs = [
+        crop(rgb),
+        crop(stages["gray"]),
+        crop(stages["threshold_30"]),
+        crop(stages["roi_cropped"]),
+        crop(stages["after_clean1"]),
+        crop(stages["after_close_median"]),
+        crop(stages["after_cc_filter"]),
+        crop(stages["final"]),
+    ]
+    cmaps = [None, "gray", "gray", "gray", "gray", "gray", "gray", "gray"]
+
+    fig, axes = plt.subplots(2, 4, figsize=(18, 9))
+    for i, ax in enumerate(axes.ravel()):
+        a = arrs[i]
+        if cmaps[i] is None:
+            ax.imshow(a, aspect="auto")
+        else:
+            # Binary / intensity panels: normalise display to [0,1]
+            a_f = np.asarray(a, dtype=float)
+            vmax = float(np.max(a_f)) if a_f.size else 1.0
+            if vmax > 1.0:
+                a_f = a_f / vmax
+            ax.imshow(a_f, cmap=cmaps[i], vmin=0, vmax=1, aspect="auto")
+        ax.set_title(titles[i], fontsize=9)
+        ax.axis("off")
+    fig.suptitle(
+        f"Morph — refine_waveform_segmentation "
+        f"(ROI y={y0}:{y1}, x={x0}:{x1}; bounds "
+        f"X=[{int(Xmin)},{int(Xmax)}] Y=[{int(Ymin)},{int(Ymax)}])",
+        fontsize=11,
+        y=0.995,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+
+def _plot_morph_envelope_debug(
+    input_image_bgr,
+    refined_mask,
+    eroded,
+    outline_raw,
+    outline_sided,
+    top_curve_mask,
+    top_curve_coords,
+    keep,
+    y_zero=None,
+    Xmin=None,
+    Xmax=None,
+    Ymin=None,
+    Ymax=None,
+    roi_pad=24,
+):
+    """
+    Method 1 (pipeline_overview): morph only inherits the refined mask, then
+    takes outline = mask − erosion, clears the non-diagnostic side, and thins.
+
+    One figure — what matters for diagnosis:
+      1) Input refined mask on RGB (errors here are inherited directly)
+      2) Shell after side-clear (keep=upper/lower)
+      3) Final one-pixel morph trace
+    """
+    refined = np.asarray(refined_mask) > 0
+    outline = np.asarray(outline_sided) > 0
+    h, w = refined.shape[:2]
+    if Xmin is None:
+        Xmin = 0
+    if Xmax is None:
+        Xmax = w
+    if Ymin is None:
+        Ymin = 0
+    if Ymax is None:
+        Ymax = h
+    sl_y, sl_x, y0, y1, x0, x1 = _morph_roi_slices(
+        h, w, Xmin, Xmax, Ymin, Ymax, roi_pad=roi_pad
+    )
+
+    def crop(a):
+        arr = np.asarray(a)
+        if arr.ndim == 2:
+            return arr[sl_y, sl_x]
+        return arr[sl_y, sl_x, ...]
+
+    rgb = cv2.cvtColor(np.asarray(input_image_bgr), cv2.COLOR_BGR2RGB)
+    rgb_c = crop(rgb)
+    refined_c = crop(refined)
+    outline_c = crop(outline)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5), sharex=True, sharey=True)
+
+    # 1) What comes in — the refined mask is the entire morph method's input
+    axes[0].imshow(rgb_c)
+    tint = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
+    tint[refined_c] = mcolors.to_rgba(MORPH_CURVE_COLOR, alpha=0.35)
+    axes[0].imshow(tint)
+    axes[0].set_title(
+        "1. Input: refined mask on RGB\n(morph inherits this body)",
+        fontsize=9,
+    )
+    axes[0].axis("off")
+
+    # 2) Shell after clearing the non-diagnostic side
+    axes[1].imshow(rgb_c)
+    shell = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
+    shell[outline_c] = mcolors.to_rgba("lime", alpha=0.9)
+    axes[1].imshow(shell)
+    axes[1].set_title(
+        f"2. Outline after side-clear (keep={keep})\nmask − erosion, non-diagnostic side zeroed",
+        fontsize=9,
+    )
+    axes[1].axis("off")
+
+    # 3) Final thinned trace
+    axes[2].imshow(rgb_c)
+    if top_curve_coords is not None and len(top_curve_coords) > 0:
+        arr = np.asarray(top_curve_coords)
+        if arr.ndim == 2 and arr.shape[1] >= 2:
+            rows, cols = arr[:, 0], arr[:, 1]
+            m = (rows >= y0) & (rows < y1) & (cols >= x0) & (cols < x1)
+            if np.any(m):
+                order = np.argsort(cols[m])
+                axes[2].plot(
+                    cols[m][order] - x0,
+                    rows[m][order] - y0,
+                    color=MORPH_CURVE_COLOR,
+                    linewidth=2.0,
+                    label="morph (1 px / col)",
+                )
+                axes[2].legend(loc="upper right", fontsize=8)
+    axes[2].set_title(
+        "3. Final morph envelope\nkeep_one_pixel_per_column",
+        fontsize=9,
+    )
+    axes[2].axis("off")
+
+    if y_zero is not None:
+        y_local = float(y_zero) - y0
+        for ax in axes:
+            ax.axhline(y_local, color="yellow", linestyle="--", linewidth=0.9, alpha=0.85)
+
+    y0_txt = f"y_zero={y_zero:.1f}" if y_zero is not None else "y_zero=None"
+    fig.suptitle(
+        f"Morph — Method 1 envelope ({y0_txt}; ROI y={y0}:{y1}, x={x0}:{x1})",
+        fontsize=11,
+        y=1.02,
+    )
+    fig.tight_layout()
+
+
+def _plot_ray_main_steps_debug(
+    roi_bgr,
+    roi_gray,
+    signal_pre_yellow,
+    yellow_mask,
+    signal_mask,
+    picked_y_raw,
+    picked_y_smooth,
+    full_rgb,
+    trace_mask_full,
+    x1,
+    x2,
+    y1,
+    y2,
+    keep,
+    max_col_step_y,
+):
+    """
+    Method 2 (pipeline_overview): k-means signal → yellow removal → column
+    picks with continuity → gap-fill / Hampel / medfilt → full-image mask.
+    """
+    roi_rgb = cv2.cvtColor(np.asarray(roi_bgr), cv2.COLOR_BGR2RGB)
+    rows, cols = roi_gray.shape
+    xs = np.arange(cols, dtype=float)
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+
+    axes[0, 0].imshow(roi_rgb)
+    axes[0, 0].set_title("1. Ray ROI (inset applied)", fontsize=9)
+    axes[0, 0].axis("off")
+
+    axes[0, 1].imshow(roi_rgb)
+    sig0 = np.ma.masked_where(~np.asarray(signal_pre_yellow), np.ones_like(roi_gray))
+    axes[0, 1].imshow(sig0, cmap="Greens", alpha=0.45, vmin=0, vmax=1)
+    axes[0, 1].set_title("2. k-means signal (k=3, ¬background)", fontsize=9)
+    axes[0, 1].axis("off")
+
+    axes[0, 2].imshow(roi_rgb)
+    yel = np.ma.masked_where(~np.asarray(yellow_mask), np.ones_like(roi_gray))
+    sig1 = np.ma.masked_where(~np.asarray(signal_mask), np.ones_like(roi_gray))
+    axes[0, 2].imshow(yel, cmap="autumn", alpha=0.55, vmin=0, vmax=1)
+    axes[0, 2].imshow(sig1, cmap="Greens", alpha=0.40, vmin=0, vmax=1)
+    axes[0, 2].set_title("3. Yellow removed → final signal", fontsize=9)
+    axes[0, 2].axis("off")
+
+    axes[1, 0].imshow(roi_gray, cmap="gray")
+    raw = np.asarray(picked_y_raw, dtype=float)
+    ok = np.isfinite(raw)
+    if np.any(ok):
+        axes[1, 0].plot(xs[ok], raw[ok], color=RAY_CURVE_COLOR, linewidth=1.2)
+    axes[1, 0].set_title(
+        f"4. Column picks (keep={keep}, step≤{int(max_col_step_y)})",
+        fontsize=9,
+    )
+    axes[1, 0].set_xlim([0, cols - 1])
+    axes[1, 0].set_ylim([rows - 1, 0])
+
+    axes[1, 1].imshow(roi_gray, cmap="gray")
+    sm = np.asarray(picked_y_smooth, dtype=float)
+    ok_s = np.isfinite(sm)
+    if np.any(ok_s):
+        axes[1, 1].plot(xs[ok_s], sm[ok_s], color=RAY_CURVE_COLOR, linewidth=1.6)
+    axes[1, 1].set_title("5. After interp + Hampel + medfilt(3)", fontsize=9)
+    axes[1, 1].set_xlim([0, cols - 1])
+    axes[1, 1].set_ylim([rows - 1, 0])
+
+    axes[1, 2].imshow(full_rgb)
+    if trace_mask_full is not None:
+        tm = np.asarray(trace_mask_full) > 0
+        if np.any(tm):
+            tint = np.zeros((*full_rgb.shape[:2], 4), dtype=float)
+            tint[tm] = mcolors.to_rgba(RAY_CURVE_COLOR, alpha=0.85)
+            axes[1, 2].imshow(tint)
+    # Draw ROI box
+    axes[1, 2].plot(
+        [x1, x2, x2, x1, x1],
+        [y1, y1, y2, y2, y1],
+        color="yellow",
+        linewidth=1.0,
+        linestyle="--",
+    )
+    axes[1, 2].set_title("6. Final ray mask on full image", fontsize=9)
+    axes[1, 2].axis("off")
+
+    fig.suptitle(
+        f"Ray — Method 2 main steps (ROI y={y1}:{y2}, x={x1}:{x2})",
+        fontsize=11,
+        y=0.995,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+
+def _plot_grow_main_steps_debug(
+    input_image_bgr,
+    refined_segmentation_mask,
+    grow_seed_mask,
+    grown_binary_mask,
+    grow_top_curve_coords,
+    Xmin,
+    Xmax,
+    Ymin,
+    Ymax,
+    yellow_forbidden_mask=None,
+    roi_pad=24,
+):
+    """
+    Method 3 (pipeline_overview): refined body → eroded seed → constrained
+    grow → envelope thinned like morph. Overlay-focused main steps.
+    """
+    rgb = cv2.cvtColor(np.asarray(input_image_bgr), cv2.COLOR_BGR2RGB)
+    h, w = rgb.shape[:2]
+    sl_y, sl_x, y0, y1, x0, x1 = _morph_roi_slices(
+        h, w, Xmin, Xmax, Ymin, Ymax, roi_pad=roi_pad
+    )
+
+    def crop(a):
+        arr = np.asarray(a)
+        if arr.ndim == 2:
+            return arr[sl_y, sl_x]
+        return arr[sl_y, sl_x, ...]
+
+    refined = np.asarray(refined_segmentation_mask) > 0
+    seed = (
+        np.asarray(grow_seed_mask, dtype=bool)
+        if grow_seed_mask is not None
+        else refined
+    )
+    grown = (
+        np.asarray(grown_binary_mask) > 0
+        if grown_binary_mask is not None
+        else np.zeros((h, w), dtype=bool)
+    )
+    new_px = grown & (~seed)
+    yellow = (
+        np.asarray(yellow_forbidden_mask, dtype=bool)
+        if yellow_forbidden_mask is not None
+        else np.zeros((h, w), dtype=bool)
+    )
+
+    rgb_c = crop(rgb)
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+
+    axes[0, 0].imshow(rgb_c)
+    tint = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
+    tint[crop(refined)] = mcolors.to_rgba(MORPH_CURVE_COLOR, alpha=0.35)
+    axes[0, 0].imshow(tint)
+    axes[0, 0].set_title("1. Input: refined mask\n(grow starts from this body)", fontsize=9)
+    axes[0, 0].axis("off")
+
+    axes[0, 1].imshow(rgb_c)
+    tint = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
+    tint[crop(seed)] = mcolors.to_rgba("lime", alpha=0.45)
+    axes[0, 1].imshow(tint)
+    axes[0, 1].set_title(
+        f"2. Seed (eroded ∩ allowed)\nr={GROW_SEED_EROSION_RADIUS}",
+        fontsize=9,
+    )
+    axes[0, 1].axis("off")
+
+    axes[0, 2].imshow(rgb_c)
+    if np.any(crop(yellow)):
+        yt = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
+        yt[crop(yellow)] = mcolors.to_rgba("orange", alpha=0.45)
+        axes[0, 2].imshow(yt)
+    axes[0, 2].set_title("3. Forbidden yellow (raster)", fontsize=9)
+    axes[0, 2].axis("off")
+
+    axes[1, 0].imshow(rgb_c)
+    tint = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
+    tint[crop(grown)] = mcolors.to_rgba(GROW_CURVE_COLOR, alpha=0.40)
+    axes[1, 0].imshow(tint)
+    axes[1, 0].set_title("4. Grown region (BFS)", fontsize=9)
+    axes[1, 0].axis("off")
+
+    axes[1, 1].imshow(rgb_c)
+    tint = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
+    tint[crop(new_px)] = mcolors.to_rgba("cyan", alpha=0.55)
+    axes[1, 1].imshow(tint)
+    axes[1, 1].set_title("5. New pixels (grown \\ seed)\ntroughs recovered here", fontsize=9)
+    axes[1, 1].axis("off")
+
+    axes[1, 2].imshow(rgb_c)
+    if grow_top_curve_coords is not None and len(grow_top_curve_coords) > 0:
+        arr = np.asarray(grow_top_curve_coords)
+        if arr.ndim == 2 and arr.shape[1] >= 2:
+            rows, cols = arr[:, 0], arr[:, 1]
+            m = (rows >= y0) & (rows < y1) & (cols >= x0) & (cols < x1)
+            if np.any(m):
+                order = np.argsort(cols[m])
+                axes[1, 2].plot(
+                    cols[m][order] - x0,
+                    rows[m][order] - y0,
+                    color=GROW_CURVE_COLOR,
+                    linewidth=2.0,
+                    label="grow envelope",
+                )
+                axes[1, 2].legend(loc="upper right", fontsize=8)
+    axes[1, 2].set_title("6. Grow envelope (morph thin on grown)", fontsize=9)
+    axes[1, 2].axis("off")
+
+    fig.suptitle(
+        f"Grow — Method 3 main steps (ROI y={y0}:{y1}, x={x0}:{x1})",
+        fontsize=11,
+        y=0.995,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+
+def _morphological_top_curve_from_mask(
+    mask_in,
+    Ymin,
+    Ymax,
+    y_zero=None,
+    morph_debug_plots=False,
+    input_image_bgr=None,
+    Xmin=None,
+    Xmax=None,
+):
     """
     Morphological envelope + one pixel per column; same logic as the first
     half of ``compute_top_curve``. Returns (top_curve_mask int, coords (N,2), keep str).
+
+    When ``morph_debug_plots`` or module ``SHOW_MORPH_DEBUG_PLOTS`` is True and
+    ``input_image_bgr`` is provided, builds Method-1 envelope debug figures.
     """
+    show_debug = bool(morph_debug_plots or SHOW_MORPH_DEBUG_PLOTS)
     mask = np.asarray(mask_in, dtype=float).copy()
     labelled = measure.label(mask)
     rp = measure.regionprops(labelled)
@@ -1303,7 +1719,8 @@ def _morphological_top_curve_from_mask(mask_in, Ymin, Ymax, y_zero=None):
         return z, np.empty((0, 2), dtype=int), "upper"
 
     ws = morphology.erosion(mask).astype(float)
-    top_curve_mask = mask - ws
+    outline_raw = mask - ws
+    top_curve_mask = outline_raw.copy()
     keep = "upper"
 
     if y_zero is not None:
@@ -1329,8 +1746,32 @@ def _morphological_top_curve_from_mask(mask_in, Ymin, Ymax, y_zero=None):
                 top_curve_mask[r, :] = 0
             keep = "lower"
 
+    outline_sided = top_curve_mask.copy()
     top_curve_mask = keep_one_pixel_per_column(top_curve_mask, keep=keep).astype(int)
     top_curve_coords = np.column_stack(np.nonzero(top_curve_mask))
+
+    if show_debug and input_image_bgr is not None:
+        try:
+            _plot_morph_envelope_debug(
+                input_image_bgr,
+                mask,
+                ws,
+                outline_raw,
+                outline_sided,
+                top_curve_mask,
+                top_curve_coords,
+                keep,
+                y_zero=y_zero,
+                Xmin=Xmin,
+                Xmax=Xmax,
+                Ymin=Ymin,
+                Ymax=Ymax,
+            )
+        except Exception:
+            logger.exception(
+                "_morphological_top_curve_from_mask: morph envelope debug plot failed"
+            )
+
     return top_curve_mask, top_curve_coords, keep
 
 
@@ -1343,6 +1784,7 @@ def segment_refinement(
     y_zero=None,
     ray_max_col_step_y=None,
     grow_debug_plots=False,
+    morph_debug_plots=False,
     grow_seed_erosion_radius=None,
     grow_forbid_yellow=True,
 ):
@@ -1367,10 +1809,13 @@ def segment_refinement(
             in image pixels. Currently unused, but accepted for future use.
         ray_max_col_step_y (int, optional): Max vertical step in pixels between
             neighbouring columns in ray tracing. Default derives from ray ROI height.
-        grow_debug_plots (bool, optional): If True, show matplotlib debug figures:
-            a full-image trace overlay, and three ROI pipeline figures (3×3 masks,
-            troughs-only, intensity profiles). Also respects
-            module-level ``SHOW_GROW_DEBUG_PLOTS``.
+        grow_debug_plots (bool, optional): If True, show Method-3 main-steps
+            figure (refined → seed → yellow → grown → new pixels → envelope).
+            Also respects module-level ``SHOW_GROW_DEBUG_PLOTS``.
+        morph_debug_plots (bool, optional): If True, show matplotlib debug figures
+            for the morphological path: refined-mask stages and Method-1
+            envelope (input mask → outline → thinned trace). Also respects
+            module-level ``SHOW_MORPH_DEBUG_PLOTS``.
         grow_seed_erosion_radius (int, optional): Disk radius in pixels for binary
             erosion of the refined mask before region-grow (0 = off). Default uses
             ``GROW_SEED_EROSION_RADIUS``.
@@ -1391,7 +1836,12 @@ def segment_refinement(
 
     # 1) Produce the refined binary segmentation mask
     refined_segmentation_mask = refine_waveform_segmentation(
-        input_image_obj, Xmin, Xmax, Ymin, Ymax
+        input_image_obj,
+        Xmin,
+        Xmax,
+        Ymin,
+        Ymax,
+        morph_debug_plots=morph_debug_plots,
     )
 
     # 1b) Constrained region grow from refined mask (seed) within ROI bounds
@@ -1444,8 +1894,9 @@ def segment_refinement(
         input_image_obj=input_image_obj,
         Xmin=Xmin,
         Xmax=Xmax,
-        plot_curve_comparison=False,
+        plot_curve_comparison=True,
         ray_max_col_step_y=ray_max_col_step_y,
+        morph_debug_plots=morph_debug_plots,
         grown_binary_mask=(
             grown_binary_mask
             if (
@@ -1458,41 +1909,20 @@ def segment_refinement(
 
     if grow_debug_plots or SHOW_GROW_DEBUG_PLOTS:
         try:
-            _plot_region_grow_pipeline_debug(
+            _plot_grow_main_steps_debug(
                 input_image_obj,
-                gray,
-                allowed,
-                yellow_forbidden,
                 refined_segmentation_mask,
+                grow_seed_bool,
                 grown_binary_mask,
+                grow_top_curve_coords,
                 Xmin,
                 Xmax,
                 Ymin,
                 Ymax,
-                grow_top_curve_coords=grow_top_curve_coords,
-                grow_seed_mask=grow_seed_bool,
+                yellow_forbidden_mask=yellow_forbidden,
             )
         except Exception:
-            logger.exception(
-                "segment_refinement: region-grow pipeline debug plot failed"
-            )
-        has_grow_mask = (
-            grown_binary_mask is not None
-            and np.any(np.asarray(grown_binary_mask) > 0)
-        )
-        has_grow_trace = (
-            grow_top_curve_coords is not None
-            and len(np.asarray(grow_top_curve_coords)) > 0
-        )
-        if has_grow_mask or has_grow_trace:
-            try:
-                _plot_region_grow_debug(
-                    input_image_obj,
-                    grown_binary_mask,
-                    grow_top_curve_coords,
-                )
-            except Exception:
-                logger.exception("segment_refinement: region-grow debug plot failed")
+            logger.exception("segment_refinement: grow main-steps debug plot failed")
 
     return (
         refined_segmentation_mask,
@@ -1505,26 +1935,48 @@ def segment_refinement(
     )
 
 
-def refine_waveform_segmentation(input_image_obj, Xmin, Xmax, Ymin, Ymax):
+def refine_waveform_segmentation(
+    input_image_obj,
+    Xmin,
+    Xmax,
+    Ymin,
+    Ymax,
+    morph_debug_plots=False,
+):
     """
     Core segmentation routine used by ``segment_refinement``.
 
     This function performs the image thresholding and all morphological
     operations required to obtain the final refined binary mask of the
     waveform region. It does **not** compute the top-curve.
+
+    When ``morph_debug_plots`` or module ``SHOW_MORPH_DEBUG_PLOTS`` is True,
+    builds a multi-panel figure of the refine stages documented in
+    pipeline_overview Stage 4.
     """
+
+    show_debug = bool(morph_debug_plots or SHOW_MORPH_DEBUG_PLOTS)
+    stages = {}
 
     # Refine segmentation to increase smoothing
     # Save output to .txt file to load later.
 
     image = input_image_obj
     input_image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if show_debug:
+        stages["gray"] = input_image_gray.copy()
+
     ret, thresholded_image = cv2.threshold(input_image_gray, 30, 255, 0)
+    if show_debug:
+        stages["threshold_30"] = thresholded_image.copy()
+
     thresholded_image[:, int(Xmax): -1] = 0
     thresholded_image[:, 0: int(Xmin) - 1] = 0
     thresholded_image[0: int(Ymin) - 50, :] = 0
     thresholded_image[int(Ymax): -1, :] = 0
     main_ROI = thresholded_image  # Main ROI
+    if show_debug:
+        stages["roi_cropped"] = main_ROI.copy()
 
     binary_image = main_ROI  # Make the image an nparray
     nonzero_pixels = (binary_image > 0).astype(bool)  # Change type
@@ -1536,12 +1988,16 @@ def refine_waveform_segmentation(input_image_obj, Xmin, Xmax, Ymin, Ymax):
     refined_segmentation_mask = morphology.erosion(refined_segmentation_mask)  # Erode the remaining binary, this can remove any ticks that may be joined to the main body
     refined_segmentation_mask = morphology.erosion(refined_segmentation_mask)  # Same as above - combine to one line if possible
     refined_segmentation_mask = morphology.dilation(refined_segmentation_mask)  # Dilate to try and recover some of the collateral loss through erosion
+    if show_debug:
+        stages["after_clean1"] = refined_segmentation_mask.astype(float).copy()
 
     refined_segmentation_mask = morphology.dilation(refined_segmentation_mask)
     refined_segmentation_mask = morphology.remove_small_holes(refined_segmentation_mask, max_size=999)
     refined_segmentation_mask = morphology.closing(refined_segmentation_mask)
     refined_segmentation_mask = refined_segmentation_mask.astype(int)
     refined_segmentation_mask = scipy.signal.medfilt(refined_segmentation_mask, 3)
+    if show_debug:
+        stages["after_close_median"] = np.asarray(refined_segmentation_mask, dtype=float).copy()
 
     # assuming mask is a binary image
     # label and calculate parameters for every cluster in mask
@@ -1560,10 +2016,22 @@ def refine_waveform_segmentation(input_image_obj, Xmin, Xmax, Ymin, Ymax):
     except Exception:
         pass
     refined_segmentation_mask = refined_segmentation_mask.astype(float)
+    if show_debug:
+        stages["after_cc_filter"] = refined_segmentation_mask.copy()
     # refined_segmentation_mask[rr, cc] = 1 #set color white
 
     blurred = gaussian_filter(refined_segmentation_mask, sigma=7)
     refined_segmentation_mask = (blurred > 0.5) * 1
+    if show_debug:
+        stages["final"] = np.asarray(refined_segmentation_mask, dtype=float).copy()
+        try:
+            _plot_morph_refine_debug(
+                image, stages, Xmin, Xmax, Ymin, Ymax
+            )
+        except Exception:
+            logger.exception(
+                "refine_waveform_segmentation: morph refine debug plot failed"
+            )
 
     return refined_segmentation_mask
 
@@ -1823,7 +2291,8 @@ def ray_trace_waveform_segmentation(
         cluster_means.append(float(np.mean(roi_gray[m])) if np.any(m) else np.inf)
         cluster_counts.append(int(np.sum(m)))
     bg_cluster = int(np.argmin(cluster_means))
-    signal_mask = (labels != bg_cluster)
+    signal_pre_yellow = labels != bg_cluster
+    signal_mask = signal_pre_yellow.copy()
     logger.info(
         "ray_trace: clusters mean_gray=%s counts=%s -> background_cluster=%s",
         [round(v, 2) if np.isfinite(v) else None for v in cluster_means],
@@ -1833,69 +2302,15 @@ def ray_trace_waveform_segmentation(
 
     # Remove yellow overlays (peak ticks / trace), same detector as region grow.
     yellow_mask = hsv_yellow_tick_mask_bgr(roi_bgr)
-    yellow_ticks = yellow_mask.copy()
-    yellow_large = np.zeros_like(yellow_mask, dtype=bool)
-    signal_mask = signal_mask & (~yellow_ticks)
+    signal_mask = signal_mask & (~yellow_mask)
 
     logger.info(
-        "ray_trace: yellow total=%s, preserved_trace=%s, excluded_ticks=%s pixels",
+        "ray_trace: yellow excluded=%s pixels; signal remaining=%s",
         int(np.sum(yellow_mask)),
-        int(np.sum(yellow_large)),
-        int(np.sum(yellow_ticks)),
+        int(np.sum(signal_mask)),
     )
 
-    if debug_plots:
-        try:
-            fig_y, axes_y = plt.subplots(1, 4, figsize=(14, 4), sharex=True, sharey=True)
-            axes_y[0].imshow(yellow_mask, cmap="gray")
-            axes_y[0].set_title("Yellow mask (all)")
-            axes_y[0].axis("off")
-
-            axes_y[1].imshow(yellow_large, cmap="gray")
-            axes_y[1].set_title("Yellow large kept")
-            axes_y[1].axis("off")
-
-            axes_y[2].imshow(yellow_ticks, cmap="gray")
-            axes_y[2].set_title("Yellow ticks removed")
-            axes_y[2].axis("off")
-
-            axes_y[3].imshow(signal_mask, cmap="gray")
-            axes_y[3].set_title("Signal after yellow-tick removal")
-            axes_y[3].axis("off")
-
-            fig_y.tight_layout()
-        except Exception:
-            logger.exception("ray_trace: yellow-removal debug plotting failed")
-
-        try:
-            fig_y2, axes_y2 = plt.subplots(1, 4, figsize=(14, 4), sharex=True, sharey=True)
-            roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
-
-            axes_y2[0].imshow(roi_rgb)
-            axes_y2[0].set_title("ROI")
-            axes_y2[0].axis("off")
-
-            axes_y2[1].imshow(roi_rgb)
-            y_all_overlay = np.ma.masked_where(~yellow_mask, yellow_mask)
-            axes_y2[1].imshow(y_all_overlay, cmap="autumn", alpha=0.65)
-            axes_y2[1].set_title("All detected yellow (overlay)")
-            axes_y2[1].axis("off")
-
-            axes_y2[2].imshow(roi_rgb)
-            y_tick_overlay = np.ma.masked_where(~yellow_ticks, yellow_ticks)
-            axes_y2[2].imshow(y_tick_overlay, cmap="winter", alpha=0.75)
-            axes_y2[2].set_title("Removed yellow ticks (overlay)")
-            axes_y2[2].axis("off")
-
-            axes_y2[3].imshow(roi_rgb)
-            signal_overlay = np.ma.masked_where(~signal_mask, signal_mask)
-            axes_y2[3].imshow(signal_overlay, cmap="Greens", alpha=0.45)
-            axes_y2[3].set_title("Final signal mask (overlay)")
-            axes_y2[3].axis("off")
-
-            fig_y2.tight_layout()
-        except Exception:
-            logger.exception("ray_trace: yellow-detector debug plotting failed")
+    show_debug = bool(debug_plots or SHOW_RAY_DEBUG_PLOTS)
 
     rows, cols = roi_gray.shape
     max_col_step_y = int(max(3, int(max_col_step_y)))
@@ -1976,6 +2391,9 @@ def ray_trace_waveform_segmentation(
             int(max_col_step_y),
         )
 
+    picked_y_raw = picked_y_per_col.copy()
+    picked_y_smooth = np.full(cols, np.nan, dtype=float)
+
     # Interpolate and connect the traced points into a continuous signal.
     valid_cols = np.where(np.isfinite(picked_y_per_col))[0]
     if valid_cols.size >= 2:
@@ -1985,6 +2403,7 @@ def ray_trace_waveform_segmentation(
         # sustained slopes (e.g. sharp approach to diastolic foot) vs kernel 5.
         y_interp = _hampel_1d(y_interp, half_window=2, n_sigmas=3.0)
         y_interp = scipy.signal.medfilt(y_interp, kernel_size=3)
+        picked_y_smooth = y_interp.astype(float)
 
         trace_mask_roi = np.zeros((rows, cols), dtype=np.uint8)
         y_idx = np.clip(np.round(y_interp).astype(int), 0, rows - 1)
@@ -1992,47 +2411,35 @@ def ray_trace_waveform_segmentation(
     else:
         # Keep sparse picks when interpolation is not possible.
         trace_mask_roi = (trace_mask_roi > 0).astype(np.uint8)
+        picked_y_smooth = picked_y_raw.copy()
 
     # Thicken traced line slightly and map back to full-image mask.
     trace_mask_roi = morphology.dilation(trace_mask_roi.astype(bool), morphology.disk(1))
     trace_mask = np.zeros((h, w), dtype=bool)
     trace_mask[y1:y2, x1:x2] = trace_mask_roi
 
-    # Debug visualisation of ray-tracing stages (disabled by default).
-    if debug_plots:
+    if show_debug:
         try:
-            fig, axes = plt.subplots(2, 3, figsize=(14, 8))
-            axes[0, 0].imshow(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB))
-            axes[0, 0].set_title("Ray trace: ROI")
-            axes[0, 0].axis("off")
-
-            axes[0, 1].imshow(signal_mask, cmap="gray")
-            axes[0, 1].set_title("Signal mask (clustered, yellow ticks excluded)")
-            axes[0, 1].axis("off")
-
-            axes[0, 2].imshow(roi_gray, cmap="gray")
-            axes[0, 2].set_title("ROI grayscale")
-            axes[0, 2].axis("off")
-
-            axes[1, 0].imshow(run3_hit_mask, cmap="gray")
-            axes[1, 0].set_title("3-consecutive signal candidates")
-            axes[1, 0].axis("off")
-
-            axes[1, 1].imshow(roi_gray, cmap="gray")
-            valid_cols = np.where(np.isfinite(picked_y_per_col))[0]
-            if valid_cols.size > 0:
-                axes[1, 1].plot(valid_cols, picked_y_per_col[valid_cols], "r-", linewidth=1)
-            axes[1, 1].set_title("Picked ray path on ROI grayscale")
-            axes[1, 1].set_xlim([0, cols - 1])
-            axes[1, 1].set_ylim([rows - 1, 0])
-
-            axes[1, 2].imshow(trace_mask_roi, cmap="gray")
-            axes[1, 2].set_title("Final ray-trace mask (ROI)")
-            axes[1, 2].axis("off")
-
-            fig.tight_layout()
+            full_rgb = cv2.cvtColor(np.asarray(image), cv2.COLOR_BGR2RGB)
+            _plot_ray_main_steps_debug(
+                roi_bgr,
+                roi_gray,
+                signal_pre_yellow,
+                yellow_mask,
+                signal_mask,
+                picked_y_raw,
+                picked_y_smooth,
+                full_rgb,
+                trace_mask,
+                x1,
+                x2,
+                y1,
+                y2,
+                keep,
+                max_col_step_y,
+            )
         except Exception:
-            logger.exception("ray_trace: debug plotting failed")
+            logger.exception("ray_trace: Method-2 main-steps debug plotting failed")
 
     return trace_mask.astype(float)
 
@@ -2048,6 +2455,7 @@ def compute_top_curve(
     plot_curve_comparison=True,
     ray_max_col_step_y=None,
     grown_binary_mask=None,
+    morph_debug_plots=False,
 ):
     """
     Given a refined segmentation mask, compute top-curve representations.
@@ -2067,9 +2475,20 @@ def compute_top_curve(
 
     If ``plot_curve_comparison`` is True, builds two figures: both coordinate
     traces on one image, and a two-panel view of the morph vs ray masks.
+
+    If ``morph_debug_plots`` or ``SHOW_MORPH_DEBUG_PLOTS`` is True, Method-1
+    envelope debug figures are built when ``input_image_obj`` is available
+    (refine-stage plots are produced earlier by ``refine_waveform_segmentation``).
     """
     top_curve_mask, top_curve_coords, keep = _morphological_top_curve_from_mask(
-        refined_segmentation_mask, Ymin, Ymax, y_zero=y_zero
+        refined_segmentation_mask,
+        Ymin,
+        Ymax,
+        y_zero=y_zero,
+        morph_debug_plots=morph_debug_plots,
+        input_image_bgr=input_image_obj,
+        Xmin=Xmin,
+        Xmax=Xmax,
     )
 
     grow_top_curve_mask = None
@@ -2077,7 +2496,11 @@ def compute_top_curve(
     if grown_binary_mask is not None and np.any(np.asarray(grown_binary_mask) > 0):
         grow_top_curve_mask, grow_top_curve_coords, _ = (
             _morphological_top_curve_from_mask(
-                grown_binary_mask, Ymin, Ymax, y_zero=y_zero
+                grown_binary_mask,
+                Ymin,
+                Ymax,
+                y_zero=y_zero,
+                morph_debug_plots=False,
             )
         )
 

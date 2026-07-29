@@ -31,8 +31,26 @@ import pandas as pd
 
 # Local imports
 from usseg import general_functions
+from usseg.general_functions import (
+    SHOW_BEAT_DEBUG_SUBPLOTS,
+    SHOW_GROW_DEBUG_PLOTS,
+    SHOW_MORPH_DEBUG_PLOTS,
+    SHOW_RAY_DEBUG_PLOTS,
+)
 
 logger = logging.getLogger(__file__)
+
+
+def _maybe_close_figures():
+    """Close matplotlib figures unless debug plotting is enabled."""
+    if (
+        SHOW_GROW_DEBUG_PLOTS
+        or SHOW_BEAT_DEBUG_SUBPLOTS
+        or SHOW_MORPH_DEBUG_PLOTS
+        or SHOW_RAY_DEBUG_PLOTS
+    ):
+        return
+    plt.close("all")
 
 
 def data_from_image(pil_img=None, cv2_img=None, image_path=None):
@@ -241,7 +259,7 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
             Yplot_g,
         )
 
-        plt.close("all")
+        _maybe_close_figures()
         return df, [x_sel, y_sel]
 
     elif us_dicom:
@@ -308,7 +326,7 @@ def data_from_image(pil_img=None, cv2_img=None, image_path=None):
                 df = pd.concat([label_row, df], ignore_index=True)
             df["Line"] = range(1, len(df) + 1)
 
-        plt.close("all")
+        _maybe_close_figures()
         return df, [Xplot, Yplot]
 
     else:
