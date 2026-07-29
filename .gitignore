@@ -181,3 +181,14 @@ cython_debug/
 
 # Scratch / one-off test scripts (not for commit)
 scratch/
+
+# Personalised config
+config.toml
+
+# LaTeX build intermediates (the PDF itself is left trackable)
+*.aux
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk

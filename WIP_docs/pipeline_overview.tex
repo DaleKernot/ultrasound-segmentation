@@ -1,0 +1,1767 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{siunitx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{xcolor}
+\usepackage{framed}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  showstringspaces=false,
+}
+
+% Inline code. Usable in math mode, where \texttt alone would be ignored.
+\newcommand{\fn}[1]{\ifmmode\text{\ttfamily #1}\else\texttt{#1}\fi}
+
+% Callout for behaviour that departs from documented or expected intent.
+\newenvironment{warningbox}%
+  {\par\begin{framed}\noindent\textbf{Discrepancy.}\ \ignorespaces}%
+  {\end{framed}\par}
+
+\title{Doppler Ultrasound Segmentation and Metric Extraction Pipeline}
+\author{Dale Kernot}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\newpage
+\section{Introduction}
+  \subsection{Motivation and clinical context}
+    Doppler ultrasound scans contain two linked sources of information. The
+    first is the image of the Doppler waveform, which can be segmented and
+    digitised into a velocity-time trace. The second is the machine-generated
+    text panel, which commonly reports clinical measurements such as peak
+    systolic velocity, end diastolic velocity, heart rate, pulsatility index,
+    and resistive index.\\
+    \\
+    The aim of this pipeline is to extract both sources of information from a
+    scan, compare them where possible, and return a structured table of
+    measurements together with a digitised waveform trace. The code is designed
+    around scans with a clearly visible Doppler waveform and machine annotation,
+    but the implementation contains fallback behaviour for incomplete axes,
+    missing labels, and scans where only part of the expected visual structure is
+    present.\\
+    \\
+    Two fundamentally different classes of input are supported, and they are
+    calibrated in fundamentally different ways. Screenshot-style raster images
+    (JPEG, PNG and similar) carry no calibration metadata, so the pipeline must
+    recover the velocity scale by reading the axis tick marks and numeric labels
+    off the image itself. DICOM files carry explicit spatial calibration in their
+    metadata, so the pixel-to-physical-unit mapping is read directly rather than
+    inferred. Keeping these two paths clearly separated is essential to
+    understanding the codebase, and this document treats them as distinct
+    branches throughout.
+
+  \subsection{Scope of this document}
+    This document describes the processing pipeline implemented in the
+    \fn{usseg} package. It is organised by processing stage. For each stage it
+    states what the stage is trying to achieve, which functions implement it,
+    what data structures flow in and out, and how the raster and DICOM paths
+    differ.\\
+    \\
+    The single-image entry point, \fn{data\_from\_image}, is used as the
+    reference implementation of the core algorithm because it contains the
+    algorithmic path with the least surrounding bookkeeping. The batch pipeline
+    performs the same algorithmic stages and adds file discovery, output
+    writing, annotation rendering, serialisation and report generation.
+
+  \subsection{Document conventions}
+    Function and module names are written in a monospaced font, for example
+    \fn{segment\_refinement}. Unless stated otherwise, functions named without a
+    module prefix live in \fn{general\_functions.py}, which holds the majority of
+    the algorithmic code.\\
+    \\
+    Image coordinates follow the convention used in the code: arrays are indexed
+    as \texttt{[row, column]}, equivalently \texttt{[y, x]}, with the row index
+    increasing downwards from the top of the image. Consequently a numerically
+    smaller row index is visually higher in the image, which matters when reading
+    the envelope-orientation logic in Section~\ref{sec:segmentation}.
+
+  \subsection{Codebase overview}
+    The modules involved in the processing pipeline are:
+
+    \begin{description}
+      \item[\fn{single\_image\_processing.py}] Provides \fn{data\_from\_image},
+        the single-scan API used by examples and tests.
+      \item[\fn{segment\_files.py}] Provides \fn{segment}, the batch workflow
+        over a list of scan files, including annotated and digitised output
+        rendering and serialisation.
+      \item[\fn{general\_functions.py}] Contains the majority of the
+        implementation: OCR and text repair, coarse and refined segmentation, the
+        three waveform tracing methods, axis detection, digitisation, beat
+        detection, metric calculation and annotation.
+      \item[\fn{hemodynamic\_indices.py}] Pure functions for the haemodynamic
+        indices (pulsatility index, resistive index, time-averaged maximum
+        velocity).
+      \item[\fn{digitized\_comparison.py}] Compares digitised measurements
+        against OCR-derived measurements and selects the best-matching
+        segmentation model.
+      \item[\fn{organise\_files.py}] Discovers candidate ultrasound files within
+        a configured directory tree.
+      \item[\fn{visualisation\_html.py}] Builds the HTML report used to inspect
+        batch results.
+      \item[\fn{setup\_environment.py}] Configures the Tesseract OCR
+        environment.
+      \item[\fn{main.py}] Batch entry point that reads \fn{config.toml},
+        discovers files, segments them and generates the HTML report.
+    \end{description}
+
+\newpage
+\section{Architecture and Entry Points}
+  \subsection{Single-image entry point}
+    \fn{data\_from\_image} in \fn{single\_image\_processing.py} processes exactly
+    one scan and returns its results in memory without writing any files. It is
+    the recommended way to inspect the behaviour of the algorithm on a single
+    input.
+
+    \begin{lstlisting}[language=Python]
+from usseg import data_from_image
+
+df, (xdata, ydata) = data_from_image(image_path="path/to/scan.png")
+    \end{lstlisting}
+
+    The function returns two objects:
+
+    \begin{description}
+      \item[\fn{df}] A pandas dataframe. For raster images this contains the
+        OCR-extracted text metrics, the digitised equivalents of those metrics
+        for each segmentation model, comparison fields, and a
+        \texttt{Returned model} entry recording which model was selected. For
+        DICOM input it contains metrics derived purely from the digitised
+        waveform, optionally preceded by a vessel/side label row.
+      \item[\fn{[xdata, ydata]}] The digitised waveform trace. For raster images
+        this is the trace of the selected model after heart-rate time scaling.
+        For DICOM it is the primary digitised series in physical units.
+    \end{description}
+
+    A legacy calling convention accepting pre-loaded Pillow and OpenCV image
+    objects is still supported, but it cannot express the DICOM path and is
+    scheduled for removal. Passing \fn{image\_path} together with either legacy
+    argument raises \fn{ValueError}.
+
+  \subsection{Batch entry point}
+    The batch pipeline is driven by \fn{main.py}, which reads \fn{root\_dir}
+    from \fn{config.toml} and calls, in order, \fn{setup\_tesseract},
+    \fn{get\_likely\_us}, \fn{segment} and \fn{generate\_html\_from\_pkl}. Each
+    of these three processing calls is wrapped in the \fn{prof} helper, which
+    profiles the call with \fn{cProfile} and writes cumulative-time statistics to
+    a per-function log file. Running the module directly also configures logging
+    at \texttt{INFO} level into \fn{batch\_main.log}.
+
+    \begin{lstlisting}[language=bash]
+python -m usseg.main
+    \end{lstlisting}
+
+  \subsection{Configuration}
+    Configuration is read from \fn{config.toml} in the working directory. The
+    keys are \fn{root\_dir}, the directory tree to search for scans;
+    \fn{output\_dir}, where rendered PNG outputs are written; and a
+    \texttt{[pickle]} table naming the intermediate serialisation files. Of the
+    three pickle keys, \fn{likely\_us\_images} and \fn{segmented\_data} are used;
+    \fn{patient\_paths} is declared but never read by any module.\\
+    \\
+    The file is loaded by relative path, so all commands must be run from the
+    repository root.
+
+  \subsection{Environment prerequisites}
+    Text extraction depends on Tesseract OCR, configured by
+    \fn{setup\_tesseract} in \fn{setup\_environment.py}. On Windows the
+    executable is expected at
+    \texttt{C:/Program Files/Tesseract-OCR/tesseract.exe}. Because every metric
+    read from the image panel and every axis label depends on OCR, an
+    incorrectly configured Tesseract installation causes the text and axis
+    calibration stages to fail even though segmentation may still succeed.
+
+\newpage
+\section{Input Classification and Modality Dispatch}
+\label{sec:dispatch}
+  \subsection{Extension-based dispatch}
+    Both entry points classify each input by file extension and set two mutually
+    exclusive flags, \fn{us\_image} and \fn{us\_dicom}. Raster extensions are
+    \texttt{.jpg}, \texttt{.jpeg}, \texttt{.png}, \texttt{.bmp}, \texttt{.gif},
+    \texttt{.tif}, \texttt{.tiff} and \texttt{.webp}; DICOM extensions are
+    \texttt{.dcm} and \texttt{.dicom}. Any other extension raises
+    \fn{ValueError} in the single-image path, and is skipped with a warning in
+    the batch path.\\
+
+    Raster inputs are loaded twice, into a Pillow image and an OpenCV BGR array.
+    The Pillow copy is converted to RGB and used for the colour-based operations
+    (text colour isolation and coarse segmentation); the OpenCV array is used for
+    thresholding, contour work, OCR input and all three tracing methods. DICOM
+    inputs are read with \fn{extract\_dicom\_metadata} and
+    \fn{extract\_doppler\_from\_dicom}, which return the calibration metadata and
+    an image pair cropped to the Doppler region.
+
+  \subsection{Why the two branches diverge}
+    The single most important structural difference is the source of
+    calibration. Table~\ref{tab:modality} summarises how the stages differ.
+
+    \begin{table}[h]
+    \centering
+    \small
+    \begin{tabular}{@{}lll@{}}
+    \toprule
+    Stage & Raster image & DICOM \\
+    \midrule
+    Metric text        & OCR of the on-screen panel & Not attempted \\
+    Region bounds      & \fn{initial\_segmentation}  & Region metadata tags \\
+    Velocity scale     & Detected axis ticks/labels  & \fn{PhysicalDeltaY} \\
+    Time scale         & Inferred from heart rate    & \fn{PhysicalDeltaX} \\
+    Zero line          & \fn{estimate\_zero\_line\_y} & \fn{ReferencePixelY0} \\
+    Yellow exclusion   & Enabled                     & Disabled \\
+    Output metrics     & OCR compared with digitised & Digitised only \\
+    \bottomrule
+    \end{tabular}
+    \caption{Stage-by-stage differences between the two processing branches.}
+    \label{tab:modality}
+    \end{table}
+
+    Everything from Section~\ref{sec:segmentation} onwards, that is the refined
+    mask and all three tracing methods, is shared between the branches. The
+    branches differ before segmentation, in how the region of interest and the
+    calibration are established, and after segmentation, in how pixel
+    coordinates are converted into physical units and which metrics are
+    reported.
+
+\newpage
+\section{Stage 1: Text Extraction and OCR Repair}
+\label{sec:ocr}
+  \emph{Raster images only.} This stage is skipped entirely for DICOM input,
+  where the metric panel is generally absent from the extracted Doppler region.\\
+  \\
+  The purpose of this stage is to recover the clinical measurements that the
+  ultrasound machine has already printed on the screen. These values serve two
+  roles: they are reported as the primary metric table, and they act as the
+  reference against which the digitised waveform is later scored, which is what
+  ultimately selects one of the three segmentation models.
+
+  \subsection{Metric panel isolation: \fn{colour\_extract\_vectorized}}
+    On the supported machines the metric panel is rendered in a distinctive
+    yellow. Rather than thresholding brightness, the code isolates that colour
+    geometrically: the target colour defines the axis of a cylinder in RGB space,
+    and a pixel is retained if it falls inside that cylinder.\\
+    \\
+    The target is $[255, 255, 100]$ with both \fn{cyl\_length} and
+    \fn{cyl\_radius} set to $95$. The axis direction is obtained from
+    \fn{append\_spherical\_1point}, which expresses the target colour in
+    spherical coordinates, and the cylinder is centred on the target with
+    endpoints \fn{start} and \fn{end}. A pixel $p$ is inside when it lies between
+    the two end planes and within the radius of the axis:
+
+    \[
+      (p-\fn{start})\cdot v \geq 0, \qquad
+      (p-\fn{end})\cdot v \leq 0, \qquad
+      \|(p-\fn{start}) \times v\| \leq \fn{cyl\_radius}\,\|v\|,
+    \]
+
+    where $v = \fn{end} - \fn{start}$. Matching pixels are set to white and all
+    others to black, producing a binary mask image. Because the test is a
+    distance in colour space rather than a per-channel range, it tolerates the
+    brightness variation of anti-aliased text.\\
+    \\
+    An earlier non-vectorised implementation, \fn{colour\_extract}, remains in the
+    module but is no longer used.
+
+  \subsection{OCR and line assembly: \fn{text\_from\_greyscale}}
+    This function performs OCR on the isolated panel and turns the result into a
+    dataframe with columns \texttt{Line}, \texttt{Word}, \texttt{Value} and
+    \texttt{Unit}. It also returns a \fn{Fail} flag.
+
+    \paragraph{Spatial pre-masking.} Before OCR, the mask is cropped by blanking
+    the left two-thirds of the width and the bottom 55\,\% of the height, because
+    on the supported layout the metric panel occupies the upper right of the
+    screen. This substantially reduces spurious detections from the waveform area.
+
+    \paragraph{Primary OCR pass.} Tesseract is invoked through
+    \fn{image\_to\_data} rather than \fn{image\_to\_string}, so that per-word
+    bounding boxes and confidences are available for the line-grouping step:
+
+    \begin{lstlisting}
+--oem 1 --psm 3 -c tessedit_char_blacklist=l,!_|=$
+    \end{lstlisting}
+
+    \fn{oem 1} selects the LSTM engine and \fn{psm 3} fully automatic page
+    segmentation. The character blacklist suppresses glyphs that are commonly
+    confused with digits or that never appear in a metric label.
+
+    \paragraph{Line grouping.} Words must be reassembled into lines before a
+    label can be matched. The vertical centre of each word box is computed and
+    clustered with DBSCAN over that single coordinate, using
+    $\fn{eps} = 5$ pixels and $\fn{min\_samples} = 2$. Words within a cluster are
+    sorted by horizontal position and joined with spaces. A consequence of
+    $\fn{min\_samples} = 2$ is that an isolated single-word line forms no cluster
+    and is therefore dropped from this source. To compensate, a second pass with
+    \fn{image\_to\_string} provides newline-delimited lines, and the two sources
+    are combined into a deduplicated union.
+
+    \paragraph{The \fn{Fail} flag.} \fn{Fail} is set to $1$ when Tesseract
+    returns fewer than 30 text tokens, which is treated as evidence that the
+    image is not a metric-panel scan. It is a heuristic on text quantity, not a
+    per-metric validity flag. Both entry points log a warning and continue when
+    \fn{Fail} is set, but skip \fn{plot\_correction}, so a scan flagged this way
+    still yields a segmentation and a trace but no OCR comparison and hence no
+    informed model selection.
+
+  \subsection{Target label sets and vessel families}
+    Matching is constrained to a vessel family so that, for example, an umbilical
+    label cannot be matched on a uterine scan. The recognised families are held in
+    \fn{METRIC\_FAMILY\_PREFIXES}, in order:
+
+    \begin{lstlisting}
+("Lt Ophthalmic", "Rt Ophthalmic", "Lt MCA", "Rt MCA",
+ "Lt Ut", "Rt Ut", "Umb", "DV")
+    \end{lstlisting}
+
+    The order matters because the more specific prefixes are tested first.
+    \fn{\_detect\_metric\_family\_from\_lines} counts how many OCR lines match
+    each prefix and selects the highest-scoring family; ophthalmic lines
+    additionally increment the count through \fn{\_line\_looks\_ophthalmic}. If no
+    family is detected the full target list is used and a warning is logged.
+
+    \begin{table}[h]
+    \centering
+    \small
+    \begin{tabular}{@{}lll@{}}
+    \toprule
+    Vessel & Prefix & Metrics sought \\
+    \midrule
+    Uterine (left/right) & \texttt{Lt Ut-}, \texttt{Rt Ut-} & PS, ED, S/D, PI, RI, MD, TAmax, HR \\
+    Umbilical            & \texttt{Umb-}   & as above \\
+    Middle cerebral      & \texttt{Lt MCA-}, \texttt{Rt MCA-} & as above \\
+    Ductus venosus       & \texttt{DV-}    & S, D, a, TAmax, S/a, a/S, PI, PLI, PVIV, HR \\
+    Ophthalmic           & \texttt{Lt/Rt Ophthalmic A.} & PS ($\times 2$), ED, PI, RI, PS/ED, ED/PS \\
+    \bottomrule
+    \end{tabular}
+    \caption{Vessel families and the metrics sought for each.}
+    \label{tab:families}
+    \end{table}
+
+    Two label lists exist per family: a plain list and an
+    \emph{extended} list carrying unit suffixes, for example
+    \texttt{"Lt Ut-PS cm/s"}. The extended list is used only by the final fuzzy
+    stage described below.
+
+  \subsection{Label matching}
+    Non-ophthalmic families are matched by a four-stage cascade, each stage
+    operating only on the targets still unmatched by the previous one. This
+    ordering is deliberate: cheap exact tests run first, and progressively looser
+    tests are applied only where necessary.
+
+    \begin{enumerate}
+      \item \textbf{Exact substring.} The target must appear literally in the
+        line.
+      \item \textbf{Subsequence.} The target's characters, ignoring spaces and
+        hyphens, must appear in order within the line. This absorbs dropped
+        characters without permitting reordering.
+      \item \textbf{Prefix Levenshtein.} The first \texttt{len(word)} characters
+        of the line are compared with the target using
+        \fn{rapidfuzz.distance.Levenshtein}, and accepted at an edit distance of
+        $7$ or less.
+      \item \textbf{Extended-label distance matrix.} Digits are stripped from the
+        line and the edit distance to each extended label is computed. If the
+        expected metric suffix (for example \texttt{PS} or \texttt{PI}) appears in
+        the line, the distance is biased by $-2$. Each remaining target then takes
+        the line with the smallest non-zero distance, assigned one-to-one so that
+        a line cannot serve two targets.
+    \end{enumerate}
+
+    \paragraph{Ophthalmic matching.} Ophthalmic scans bypass the cascade entirely
+    and use \fn{\_match\_ophthalmic\_lines}. The reason is structural: ophthalmic
+    panels report two peak-systolic measurements, so labels cannot be identified
+    by text alone and position must be used. Each line is classified by
+    \fn{\_ophthalmic\_metric\_kind} into \texttt{PS}, \texttt{ED}, \texttt{PI},
+    \texttt{RI}, \texttt{PS/ED} or \texttt{ED/PS}, and \texttt{PS} lines are
+    assigned to the numbered targets in the order encountered. Orphan numeric
+    lines with no label are attached to the first PS row still holding zero.
+    Laterality is inferred by \fn{\_detect\_ophthalmic\_side\_from\_ocr}, which
+    counts standalone \texttt{Lt} and \texttt{Rt} tokens and resolves ties in
+    favour of \texttt{Rt}. \textbf{This is not a comprehensive solution to Ophthalmic label matching and improvements could be made.}
+
+  \subsection{Value parsing and numeric repair}
+    Values are taken from the end of the matched line with an anchored regular
+    expression that tolerates OCR-split decimals such as \texttt{"27 . 35"}, and
+    captures any trailing non-numeric group as the unit. Spaces are removed from
+    the captured number before conversion. A matched label with no parseable
+    number yields a row with a zero value rather than being dropped, so that the
+    metric's absence is visible downstream.\\
+    \\
+    There is no character-level substitution table (for instance mapping a
+    misread \texttt{S} to \texttt{5}). Instead, misplaced decimal points are
+    repaired by magnitude: a value that is implausible by an order of magnitude is
+    divided down into its physiological range. \fn{check\_pi\_value} divides a
+    pulsatility index by 10 in the range $3$--$10$ and by 100 in the range
+    $10$--$200$; the PS/ED normalisation applies the same principle for
+    velocities, dividing by 10 between $250$ and $1000$ and by 100 between $1000$
+    and $10000$; \fn{check\_S\_D\_value} does likewise for ductus venosus values.
+    The approach is effective because the true ranges of these quantities are
+    narrow and well separated from their decimal-shifted counterparts.
+
+  \subsection{Heart rate refinement}
+    Heart rate deserves special treatment because it is the only quantity that
+    calibrates the raster time axis (Section~\ref{sec:digitisation}); an error
+    here propagates into every time-dependent result.\\
+    \\
+    After the first pass, \fn{refine\_hr\_from\_local\_roi} re-reads the heart
+    rate from a locally enhanced crop. The ROI around the HR line is padded by
+    $\max(15,\,35\%)$ of its width and $\max(10,\,80\%)$ of its height, then
+    equalised, blurred, Otsu-thresholded and upscaled by a factor of two before a
+    constrained OCR pass using \fn{psm 7} with a character whitelist, falling back
+    to \fn{psm 6}. Candidates are accepted only within $20$--$240$\,bpm.\\
+    \\
+    The reconciliation rule is conservative. The refined value replaces the first
+    pass only if the first-pass value is implausible; if both are plausible but
+    differ by more than $3$\,bpm the first-pass value is kept and a warning is
+    logged. Finally the absolute value is taken, since a spurious minus sign is a
+    common OCR artefact.
+
+  \subsection{Metric consistency checks}
+    The final step exploits the algebraic relationships between the reported
+    metrics to detect and repair OCR errors. Three variants exist, dispatched by
+    family: \fn{metric\_check} for uterine, umbilical and MCA scans,
+    \fn{metric\_check\_ophthalmic} for ophthalmic, and \fn{metric\_check\_dv} for
+    ductus venosus. All of them preserve the original readings in a
+    \texttt{Raw Value} column before making corrections, so that repairs remain
+    auditable.\\
+    \\
+    \fn{metric\_check} recomputes the three derived quantities from the extracted
+    peak-systolic and end-diastolic velocities,
+    \[
+      (S/D)_{\text{calc}} = \frac{PS}{ED}, \qquad
+      RI_{\text{calc}} = \frac{PS-ED}{PS}, \qquad
+      TA_{\text{max,calc}} \approx \frac{PS + 2\,ED}{3},
+    \]
+    and compares each with the extracted value at a tolerance of $0.5$. Time
+    averaged maximum velocity is treated specially: it is accepted if its
+    magnitude simply lies between $ED$ and $PS$, because the closed-form estimate
+    above is only an approximation.\\
+    \\
+    The outcome depends on how many of the three agree. If all three agree,
+    nothing is changed. If one or two agree, the disagreeing or missing fields are
+    recomputed from the corrected velocities. If none agree, the code assumes $PS$
+    is correct and back-solves $ED$ from the reported ratio or resistive index;
+    should both resulting candidates fall below $2$, it reverses the assumption,
+    treats $ED$ as correct and recomputes $PS$. This is the most aggressive repair
+    in the pipeline and the primary reason the raw values are retained.\\
+    \\
+    The ophthalmic and ductus venosus variants follow the same pattern with
+    different tolerances and formulae: ophthalmic uses $0.5$ for the ratio and
+    $0.1$ for the resistive index, while ductus venosus uses $0.2$ for $S/a$ and
+    $PI$ and a looser $2.0$ for the approximated time-averaged velocity. The
+    ductus venosus path additionally applies pre-swap heuristics in
+    \fn{text\_from\_greyscale} to correct values that OCR has attributed to the
+    wrong label.
+
+\newpage
+\section{Stage 2: Coarse Localisation of the Doppler Region}
+\label{sec:coarse}
+  \subsection{Raster: \fn{initial\_segmentation}}
+    \fn{initial\_segmentation} finds the approximate extent of the Doppler
+    waveform panel in a raster screenshot. It exploits the fact that the
+    waveform and its surrounding trace are rendered in near-neutral greys, so
+    they can be separated from coloured annotation and from the dark background
+    by a colour-neutrality test rather than by brightness alone.\\
+    \\
+    The function iterates over every pixel of the RGB image and retains the
+    pixel only if the spread across the three channels is small and the pixel is
+    reasonably bright:
+
+    \[
+      \left(\max(r,g,b) - \min(r,g,b)\right) < 100
+      \quad\text{and}\quad
+      \max(r,g,b) > 120 .
+    \]
+    Pixels satisfying both conditions are set to white and all others to black.
+    A band at the top of the image is then forced to black to suppress the
+    header region: rows above 500 for images taller than 600 pixels, and rows
+    above 20 otherwise.\\
+    \\
+    The resulting binary image is cleaned by removing small objects and small
+    holes at a size threshold of 199 pixels, followed by two erosions and one
+    dilation. The erosions detach tick marks that touch the waveform body and
+    the dilation recovers part of the resulting loss. Contours are then extracted
+    with \fn{skimage.measure.find\_contours}, and the returned bounds
+    \fn{Xmin}, \fn{Xmax}, \fn{Ymin} and \fn{Ymax} are the extremes across
+    \emph{all} contours, that is the bounding box of every surviving object
+    rather than of a single selected component.\\
+    \\
+    Two practical consequences follow. First, because the bounding box spans all
+    surviving contours, residual bright artefacts inside the search area widen
+    the reported region. Second, the per-pixel Python loop makes this one of the
+    slowest steps in the pipeline; it is a natural target for vectorisation.
+
+  \subsection{Raster: \fn{define\_end\_rois}}
+    \fn{define\_end\_rois} derives the two side regions in which axis ticks and
+    labels are later sought. Given the coarse bounds and the image dimensions it
+    returns two \texttt{[Xmin, Xmax, Ymin, Ymax]} lists:
+
+    \begin{description}
+      \item[Left ROI] spans horizontally from column $0$ to $\fn{Xmin}-1$, that
+        is everything to the left of the waveform.
+      \item[Right ROI] spans horizontally from \fn{Xmax} to the right-hand edge
+        of the image.
+    \end{description}
+    Both regions share the same vertical extent. The top is set to
+    $\fn{Ymin}-75$ when $\fn{Ymin}-125 > 0$, and to row $1$ otherwise; the
+    bottom is the full image height. The upward extension is deliberate: axis
+    labels are frequently printed slightly above the top of the traced waveform,
+    so an ROI clipped exactly at \fn{Ymin} would omit the highest label.
+
+  \subsection{DICOM: region bounds from metadata}
+    The DICOM branch does not call either function above. The waveform bounds are
+    taken directly from the ultrasound region metadata as
+    \fn{RegionLocationMinX0}, \fn{RegionLocationMaxX1},
+    \fn{RegionLocationMinY0} and \fn{RegionLocationMaxY1}, and the zero-velocity
+    row is computed as $\fn{RegionLocationMinY0} + \fn{ReferencePixelY0}$. The
+    bounds are therefore exact rather than estimated, which removes a whole
+    class of failure that the raster branch must tolerate.
+
+\newpage
+\section{Stage 3: Axis Calibration}
+\label{sec:axes}
+  Calibration establishes the mapping from image row to physical velocity. This
+  is the stage where the two modalities differ most sharply: for DICOM it is a
+  metadata lookup, whereas for raster images the entire scale must be recovered by
+  locating tick marks and reading their printed values by OCR.
+
+  \subsection{Raster: tick detection with \fn{search\_for\_ticks}}
+    \fn{search\_for\_ticks} is called once per side with \fn{side} set to
+    \texttt{"Left"} or \texttt{"Right"}, and returns twelve values. The important
+    ones are \fn{Cs} (tick contours), \fn{CenPoints} (tick centres in ROI-local
+    coordinates), \fn{ROIAX} (the axis ROI cropped so that it contains the labels
+    but not the tick strokes) and \fn{TYLshift} (the offset used for that crop).
+    The remainder are intermediate images and pass-through arguments consumed by
+    \fn{search\_for\_labels}.\\
+    \\
+    The algorithm is:
+
+    \begin{enumerate}
+      \item Crop the side ROI produced by \fn{define\_end\_rois} and threshold the
+        greyscale image at an intensity of 127.
+      \item Find contours in the ROI and draw them into a working image.
+      \item \textbf{Right side only:} re-label the ROI and retain only components
+        with an area between 5 and 200 pixels and a height below 5 pixels, that is
+        objects shaped like short horizontal strokes. Columns are then blanked if
+        they intersect more than 20 such objects or none at all. This suppresses
+        the dense text of the adjacent panel, which is a problem on the right side
+        but not the left.
+      \item Re-find contours on the filtered image and compute each contour's
+        centre.
+      \item \textbf{Select the tick column.} For every column in the ROI, count
+        the contours whose $x$ extent includes that column, giving a
+        one-dimensional profile. \fn{scipy.signal.find\_peaks} is applied to that
+        profile with $\fn{height} = 3$, requiring at least three aligned objects
+        for a column to be considered.
+      \item Retain the contours lying on the selected column, recording their
+        centres and endpoints.
+      \item \textbf{Left side only:} reject the worst endpoint outlier using a
+        modified $z$-score against the median with $m = 8.0$.
+      \item Compute \fn{TYLshift} and re-crop \fn{ROIAX} so that OCR sees the
+        numeric labels without the tick strokes, which would otherwise be read as
+        hyphens.
+    \end{enumerate}
+    %TODO: Add a figure showing the tick detection process.
+    %TODO: Explain terms like TYLshift, ROIAX, etc.
+    \paragraph{Asymmetry in column selection.} The two sides choose the tick
+    column by different criteria, and this is the most consequential difference
+    between them. For the right axis the strongest peak is chosen by the product
+    of peak height and peak width:
+
+    \begin{lstlisting}[language=Python]
+peak_wid = signal.peak_widths(all, peaks)
+maxID = np.argmax(vals["peak_heights"] * peak_wid[0])
+    \end{lstlisting}
+
+    For the left axis the selection is instead:
+
+    \begin{lstlisting}[language=Python]
+maxID = np.argmax(peaks)
+    \end{lstlisting}
+
+    Because \fn{peaks} contains column indices in ascending order, taking its
+    \fn{argmax} selects the \emph{last} entry, that is the right-most candidate
+    column in the left ROI. This is the column nearest the waveform, which is
+    where left-axis ticks are expected, so the behaviour is reasonable; but it is
+    expressed as a maximum over positions rather than as an explicit choice of the
+    last peak, which obscures the intent and makes the line easy to misread.
+
+    \paragraph{Failure when no ticks exist.} Both selections index \fn{peaks}
+    unconditionally. On a scan with no ticks on a given side the profile has no
+    peaks, \fn{peaks} is empty, and the call raises
+    \texttt{ValueError: attempt to get argmax of an empty sequence}. This is the
+    normal, expected outcome for scans that print labels on one side only, and it
+    is caught by the caller; see Section~\ref{sec:axistolerance}.
+
+  \subsection{Raster: label detection and pairing with \fn{search\_for\_labels}}
+    This function reads the numeric tick values and associates each with a tick
+    position. It returns the cropped ROI, the list of label strings
+    (\fn{number}), their paired positions in full-image coordinates
+    (\fn{positions}), and a full-size debug canvas.
+
+    \paragraph{Threshold sweep with a plausibility stop.} Rather than committing
+    to one binarisation, the function sweeps the threshold from 100 to 185 in
+    steps of 5, running OCR at each value with
+
+    \begin{lstlisting}
+--psm 11 -c tessedit_char_whitelist=-0123456789
+    \end{lstlisting}
+    and stops as soon as every parsed number is divisible by 5. This exploits a
+    strong prior about Doppler displays: velocity axes are labelled in multiples
+    of five, so divisibility is an inexpensive proxy for a clean read. The
+    whitelist restricts output to digits and the minus sign, and \fn{psm 11}
+    treats the crop as sparse text.
+
+    \paragraph{Box handling.} Tesseract emits repeated rows per box, which are
+    deduplicated by an index test; the first box is skipped, and empty or
+    hyphen-only labels are discarded. Label centres are computed from the bounding
+    boxes, with \fn{TYLshift} added back on the right side to undo the earlier
+    crop. If any two label centres lie within 20 pixels of each other, the code
+    logs \texttt{"Characters too close"}, indicating that two labels may have been
+    merged.
+
+    \paragraph{Pairing.} Each label centre is matched to its nearest tick centre
+    by Euclidean distance using \fn{scipy.spatial.distance.cdist}, and the
+    matched tick position is offset back into full-image coordinates. Finally
+    \fn{correct\_number\_format} strips a trailing hyphen from values such as
+    \texttt{"40-"}, an artefact of a tick stroke that survived the crop.
+
+    \paragraph{Fallback.} If pairing fails, the function re-runs OCR and uses the
+    label box centres themselves as the tick positions. This is less accurate,
+    because a label's centre is horizontally offset from its tick, but it keeps
+    calibration possible when tick detection has partially failed. The
+    \fn{cdist} call is also the origin of the
+    \texttt{ValueError: XA must be a 2-dimensional array} seen on scans with no
+    labels on one side, since an empty list of centre points has no second
+    dimension.
+
+  \subsection{Raster: validation of ticks}
+    \fn{validate\_axis\_ticks} cleans a single side's ticks. It never mutates its
+    inputs and returns a corrected copy. Values that cannot be parsed as floats
+    are skipped, and if fewer than two ticks remain, or the value and position
+    counts disagree, the inputs are returned unchanged.\\
+    \\
+    Ticks are sorted by pixel row and then repeatedly filtered until stable:
+
+    \begin{itemize}
+      \item Ticks sharing an identical row are collapsed: if they carry the same
+        value the last is kept, and if they conflict the whole cluster is dropped.
+      \item The slope $\Delta \text{value} / \Delta y$ is computed between
+        successive ticks. Slopes are clustered within a relative tolerance
+        \fn{spacing\_tol} $= 0.2$, and the largest cluster is taken as dominant.
+      \item A single anomalous slope at either end drops the corresponding end
+        tick; exactly two consecutive anomalous slopes drop the tick between them;
+        a specific three-slope pattern drops both an interior tick and an
+        endpoint. Any more complex pattern only logs a warning and stops, on the
+        principle that it is safer to keep suspect ticks than to guess.
+    \end{itemize}
+    One caveat worth recording: the function computes monotonicity flags for the
+    ordered values but does not act on them. A non-monotonic set of tick values is
+    therefore not rejected on that basis alone, and is only corrected if it also
+    produces an anomalous slope pattern.
+
+  \subsection{Raster: cross-checking the two axes}
+    \fn{validate\_axis\_pair} compares the sides where both were detected. It
+    builds a value-to-row map for each side, intersects the tick values common to
+    both, and warns if the mean row for a shared value differs by more than
+    \fn{y\_tol\_pixels} $= 5.0$. When the sides share no values the result is
+    inconclusive and reported as agreement. The function is purely diagnostic: it
+    returns a boolean and changes no data, and its result is used only to decide
+    which side to trust during digitisation.
+
+  \subsection{Raster: zero-line estimation}
+    \fn{estimate\_zero\_line\_y\_axis} finds the row corresponding to zero
+    velocity for one side. If any tick value is zero within $10^{-3}$ it returns
+    the mean row of those ticks. Otherwise, given at least two ticks, it fits a
+    straight line of row against value with \fn{numpy.polyfit} and returns the
+    intercept at zero. The fit matters because it recovers the baseline even when
+    it is off-screen or unlabelled, which is common when a display shows only
+    positive velocities.\\
+    \\
+    \fn{estimate\_zero\_line\_y} then fuses the two sides. With one side available
+    it returns that estimate. With both, it prefers whichever side has at least
+    three ticks when the other has fewer; if the sides are comparable it warns
+    when they differ by more than 5 pixels and returns their mean. The result is
+    passed to \fn{segment\_refinement}, where it decides waveform orientation
+    (Section~\ref{sec:keep}). A \fn{None} result is tolerated and triggers the
+    centroid-based fallback described there.
+
+  \subsection{DICOM: calibration from metadata}
+    The DICOM branch performs none of the above. \fn{extract\_dicom\_metadata}
+    reads the Sequence of Ultrasound Regions, tag $(0018,6011)$, and selects the
+    first region whose Region Spatial Format and Region Data Type are both $3$,
+    identifying the pulsed-wave spectral region. From that region it reads the
+    bounding box, the reference pixel, the reference physical values and the
+    physical deltas, listed in Table~\ref{tab:dicomtags}.\\
+    \\
+    \begin{table}[h]
+    \centering
+    \small
+    \begin{tabular}{@{}lll@{}}
+    \toprule
+    Key & Tag & Role \\
+    \midrule
+    \fn{RegionLocationMinX0}          & $(0018,6018)$ & ROI left \\
+    \fn{RegionLocationMinY0}          & $(0018,601A)$ & ROI top \\
+    \fn{RegionLocationMaxX1}          & $(0018,601C)$ & ROI right \\
+    \fn{RegionLocationMaxY1}          & $(0018,601E)$ & ROI bottom \\
+    \fn{ReferencePixelX0}             & $(0018,6020)$ & Origin column \\
+    \fn{ReferencePixelY0}             & $(0018,6022)$ & Origin row (baseline) \\
+    \fn{ReferencePixelPhysicalValueX} & $(0018,6028)$ & Physical value at origin \\
+    \fn{ReferencePixelPhysicalValueY} & $(0018,602A)$ & Physical value at baseline \\
+    \fn{PhysicalDeltaX}               & $(0018,602C)$ & Units per column \\
+    \fn{PhysicalDeltaY}               & $(0018,602E)$ & Units per row \\
+    \bottomrule
+    \end{tabular}
+    \caption{DICOM tags used for calibration.}
+    \label{tab:dicomtags}
+    \end{table}
+    Only the header is read, using \fn{stop\_before\_pixels=True}. Missing
+    elements resolve to \fn{None} rather than raising, and any exception causes
+    the function to return an empty dictionary; in that case the absence of
+    bounding-box keys will surface later as an arithmetic error during
+    digitisation. The physical units tags $(0018,6024)$ and $(0018,6026)$ are
+    recorded but not consulted during conversion, so the code implicitly assumes
+    the conventional units of centimetres per second and seconds.
+
+  \subsection{Tolerance of missing axes}
+  \label{sec:axistolerance}
+    Both entry points wrap each side's tick and label search in its own
+    \fn{try}/\fn{except}, initialising \fn{Lnumber}, \fn{Lpositions},
+    \fn{Rnumber} and \fn{Rpositions} to \fn{None} beforehand. A side that fails
+    leaves its variables as \fn{None} and the pipeline proceeds on the other
+    side. This is what allows scans that label only one axis to be processed at
+    all, and it is by design rather than by accident.\\
+    \\
+    The cost is diagnostic noise. In \fn{segment\_files.py} the handlers call
+    \fn{traceback.print\_exc()} in addition to logging, so an entirely expected
+    single-sided scan still prints full tracebacks for every image processed. The
+    exceptions are handled, but they are not silenced, which makes a healthy batch
+    run look as though it is failing.
+
+\newpage
+\section{Stage 4: Waveform Segmentation and the Three Tracing Methods}
+\label{sec:segmentation}
+  This is the algorithmic core of the package and it is shared by both
+  modalities. It proceeds in two parts. First a single refined binary mask of the
+  waveform body is produced. Then \emph{three independent methods} extract a
+  one-pixel-per-column trace of the waveform envelope. All three are computed
+  for every scan; the choice between them is deferred to
+  Section~\ref{sec:selection}.
+
+  \subsection{Orchestration: \fn{segment\_refinement}}
+    \fn{segment\_refinement} is the single entry point for this stage and is
+    called identically by both entry points, except for the
+    \fn{grow\_forbid\_yellow} flag which is \texttt{True} for raster images and
+    \texttt{False} for DICOM. Its sequence is:
+
+    \begin{enumerate}
+      \item Build the refined binary mask with
+        \fn{refine\_waveform\_segmentation}.
+      \item Convert the image to greyscale and construct the permitted region
+        \fn{allowed} with \fn{allowed\_mask\_from\_roi\_bounds}.
+      \item If \fn{grow\_forbid\_yellow} is set, build a forbidden-region mask of
+        instrument yellow with \fn{hsv\_yellow\_tick\_mask\_bgr}.
+      \item Shrink the refined mask into a conservative seed with
+        \fn{\_shrink\_seed\_for\_region\_grow}.
+      \item Grow that seed with \fn{constrained\_region\_grow}.
+      \item Derive all three envelope traces with \fn{compute\_top\_curve}.
+    \end{enumerate}
+    It returns seven values: the refined mask, and a mask/coordinate pair for
+    each of the morphological, ray-traced and grown traces. The latter two pairs
+    are \fn{None} if their method failed or produced an empty result, so all
+    downstream code must tolerate missing traces.
+
+  \subsection{The shared refined mask: \fn{refine\_waveform\_segmentation}}
+    This function produces the binary waveform body that both the morphological
+    method and the region-growing seed are derived from. Unlike
+    \fn{initial\_segmentation} it works on the greyscale OpenCV image and uses a
+    fixed intensity threshold:
+
+    \begin{enumerate}
+      \item Convert BGR to greyscale and threshold at an intensity of 30.
+      \item Zero everything outside the region of interest. Note the asymmetric
+        vertical margin: the top boundary is $\fn{Ymin}-50$ rather than
+        \fn{Ymin}, deliberately admitting rows above the coarse bound so that
+        systolic peaks clipped by Stage~2 are recoverable.
+      \item Remove small objects and holes (199 pixels), erode twice, dilate.
+      \item Dilate again, remove holes up to 999 pixels, apply a morphological
+        closing, then a $3\times3$ median filter.
+      \item Label connected components and discard everything smaller than the
+        second-largest area plus 10, which in practice retains only the main
+        waveform body.
+      \item Blur with a Gaussian of $\sigma = 7$ and re-threshold at $0.5$,
+        smoothing the outline so that the envelope extracted from it is not
+        dominated by pixel-level noise.
+    \end{enumerate}
+
+  \subsection{Envelope orientation: upper or lower}
+  \label{sec:keep}
+    Doppler waveforms may be displayed above or below the baseline, so before any
+    envelope is extracted the code must decide which side of the waveform body is
+    the diagnostic envelope. This decision, held in the variable \fn{keep} with
+    value \texttt{"upper"} or \texttt{"lower"}, is made once in
+    \fn{\_morphological\_top\_curve\_from\_mask} and then \emph{reused} for the
+    ray tracer, ensuring that all methods trace the same side of the waveform.\\
+    \\
+    When a zero line is available the mask outline rows are counted above and
+    below it, and the waveform is treated as inverted when more of the outline
+    lies below the baseline. Rows on the non-diagnostic side are then cleared.
+    When no zero line is available the code falls back to the centroid row of the
+    first labelled region and validates the choice with
+    \fn{check\_inverted\_curve}, which declares the trace inverted if the
+    retained outline spans less than a fraction \texttt{tol} $= 0.25$ of the
+    waveform height; if so, the opposite side is kept instead.
+
+  \subsection{Method 1: Morphological envelope}
+  \label{sec:morph}
+    Implemented by \fn{\_morphological\_top\_curve\_from\_mask}. This is the
+    original method and the only one guaranteed to be produced.\\
+    \\
+    The mask is eroded once and the erosion subtracted from the original,
+    $\text{outline} = \text{mask} - \text{erosion}(\text{mask})$, leaving a
+    one-pixel shell around the waveform body. The non-diagnostic side is cleared
+    as described in Section~\ref{sec:keep}, and
+    \fn{keep\_one\_pixel\_per\_column} reduces the shell to a single pixel per
+    column, taking the visually uppermost or lowermost pixel according to
+    \fn{keep}.\\
+    \\
+    The method is fast, deterministic and entirely dependent on the quality of
+    the refined mask. Because the mask has been Gaussian-smoothed, the resulting
+    trace is smooth but can be blunted at sharp systolic peaks, and any
+    thresholding error in the mask is inherited directly.
+
+  \subsection{Method 2: Ray tracing}
+  \label{sec:ray}
+    Implemented by \fn{ray\_trace\_waveform\_segmentation} and used as the
+    primary metric source downstream. Rather than deriving the envelope from a
+    binary mask, this method re-examines the original image column by column,
+    which allows it to follow a faint envelope that global thresholding would
+    lose.\\
+    \\
+    Its region of interest is computed by
+    \fn{ray\_trace\_roi\_from\_refined\_mask} from the bounding box of the
+    refined mask, padded by $\max(8, 3\%)$ of the box width horizontally,
+    $\max(18, 35\%)$ of its height above and $\max(6, 6\%)$ below, then inset by
+    15 pixels horizontally. The generous top padding exists so that peaks
+    excluded from the refined mask remain inside the search area. A further hard
+    inset of 20 pixels per side is applied inside the tracer itself to exclude
+    border artefacts.\\
+    \\
+    The algorithm then proceeds as follows.
+
+    \begin{enumerate}
+      \item \textbf{Adaptive signal/background separation.} All ROI pixels are
+        clustered in BGR colour space with $k$-means, $k=3$. The cluster with the
+        lowest mean greyscale is declared background and the remaining two
+        clusters become signal candidates. Because the split is learned per
+        image, this adapts to scans of differing brightness instead of relying on
+        a fixed threshold.
+      \item \textbf{Instrument-yellow removal.} Pixels identified by
+        \fn{hsv\_yellow\_tick\_mask\_bgr} (hue $18$--$40$, saturation $>90$,
+        value $>90$, followed by an opening with a disk of radius 1) are removed
+        from the signal, so that the machine's own yellow peak markers are not
+        mistaken for the envelope.
+      \item \textbf{Continuity-constrained column scan.} Columns are traversed
+        left to right. Each column is first searched only within
+        $\pm\,\fn{max\_col\_step\_y}$ rows of the previous column's pick, which
+        enforces vertical continuity and prevents the trace jumping to an
+        unrelated structure. Within that window,
+        \fn{\_pick\_y\_from\_column\_signal} prefers the first run of three
+        consecutive signal pixels, taking the uppermost or lowermost such run
+        according to \fn{keep}; if no run exists it falls back to the brightest
+        pixel in the window. If the banded search fails entirely the whole column
+        is searched and the result is clipped back into the permitted step.
+      \item \textbf{Gap filling and smoothing.} Columns with no pick are filled
+        by linear interpolation, isolated outliers are suppressed by a Hampel
+        filter (half-window 2, $3\sigma$), and a width-3 median filter is
+        applied. The narrow kernels are a deliberate compromise: they remove
+        spikes while preserving the steep genuine slope into the diastolic foot.
+      \item The trace is rasterised, dilated by a disk of radius 1 and mapped
+        back into full-image coordinates.
+    \end{enumerate}
+    The step limit \fn{max\_col\_step\_y} defaults to
+    $\max(30, \text{ROI height}/25)$ and is clamped to at least 3. It is the
+    method's most consequential parameter: too small and the trace cannot follow
+    a steep systolic upstroke, too large and continuity no longer constrains it.
+
+  \subsection{Method 3: Constrained region growing}
+  \label{sec:grow}
+    Implemented by \fn{constrained\_region\_grow}. This method exists to recover
+    parts of the waveform that the fixed threshold in
+    \fn{refine\_waveform\_segmentation} misses, most notably the dimmer signal in
+    the diastolic troughs, by expanding outward from a confident core rather than
+    classifying each pixel independently.
+
+    \paragraph{Seed preparation.} The refined mask is first shrunk by
+    \fn{\_shrink\_seed\_for\_region\_grow}, which erodes it with a disk of radius
+    \fn{GROW\_SEED\_EROSION\_RADIUS} $= 10$ and intersects the result with the
+    permitted region. Shrinking matters because the seed statistics drive the
+    acceptance test: an over-thick seed biases the intensity model towards the
+    bright waveform core and prevents growth into the troughs. If erosion removes
+    every seed pixel the function logs a warning and falls back to the
+    unshrunken intersection.
+
+    \paragraph{Constraints.} Growth is restricted to \fn{allowed}, the ROI mask
+    produced by \fn{allowed\_mask\_from\_roi\_bounds} (which applies the same
+    $\fn{Ymin}-50$ top margin as the refined mask). A separate
+    \fn{forbidden\_mask} may additionally block expansion without excluding seed
+    pixels; for raster images this carries the instrument-yellow mask, and for
+    DICOM it is disabled via \fn{grow\_forbid\_yellow=False} because yellow is
+    rare there and masking it removes real signal.
+
+    \paragraph{Intensity model.} The greyscale image is normalised to $[0,1]$
+    over the whole image. From the seed the mean and standard deviation are
+    computed, and an absolute floor is derived as
+    \[
+      \fn{min\_intensity} = \max\!\left(
+        \mu_{\text{seed}} - \max\!\left(5.0\,\sigma_{\text{seed}},\; 0.40\right),\;
+        0.05 \right).
+    \]
+    The initial acceptance band is $\mu_{\text{seed}} \pm 0.43$, clamped by that
+    floor and by 1.
+
+    \paragraph{Growth.} A breadth-first flood fill runs from every seed pixel.
+    The neighbourhood is a Chebyshev ball of radius
+    \fn{GROW\_NEIGHBOUR\_CHEBYSHEV\_RADIUS} $= 2$, that is a $5\times5$
+    neighbourhood, which lets the region bridge one-pixel gaps in a faint
+    envelope; the \fn{connectivity} argument only applies when the radius is 1. A
+    candidate is rejected outright below \fn{min\_intensity}. Otherwise, because
+    \fn{update\_seed\_stats} defaults to \texttt{True}, the acceptance band is
+    recomputed from the running mean and standard deviation of all accepted
+    pixels as
+    $\mu \pm \max(3.9\,\sigma, \fn{intensity\_tol})$, again clamped. This lets
+    the region adapt as it moves into dimmer areas. Growth stops when the region
+    reaches \fn{max\_area\_growth} $= 3.0$ times the seed area, which bounds both
+    runtime and the extent of any leak into the background.
+
+    \paragraph{Envelope extraction.} The grown mask is passed back through
+    \fn{\_morphological\_top\_curve\_from\_mask}, so Method~3 differs from
+    Method~1 only in the mask it operates on, not in how the envelope is thinned.
+
+  \subsection{Dispatch and comparison: \fn{compute\_top\_curve}}
+    \fn{compute\_top\_curve} produces all three traces and returns them as three
+    mask/coordinate pairs. The morphological envelope is always computed first
+    because it establishes the shared \fn{keep} orientation. The grown envelope is
+    computed only if a non-empty grown mask was supplied, and the ray trace only
+    if the original image and coarse $x$ bounds were supplied; the ray call is
+    wrapped in a \fn{try}/\fn{except} so a tracing failure degrades to
+    \fn{None} rather than aborting the scan.
+
+    \begin{table}[h]
+    \centering
+    \small
+    \begin{tabular}{@{}p{2.3cm}p{3.4cm}p{3.4cm}p{3.9cm}@{}}
+    \toprule
+     & Morphological & Ray tracing & Region growing \\
+    \midrule
+    Operates on & Refined binary mask & Original pixel data & Refined mask as seed \\
+    Separation  & Fixed threshold of 30 & Per-image $k$-means, $k=3$ & Adaptive intensity band \\
+    Envelope    & Erosion difference, thinned & Per-column pick & Erosion difference, thinned \\
+    Continuity  & Implicit in the mask & Enforced by step limit & Implicit in connectivity \\
+    Strength    & Robust, deterministic & Follows faint envelopes & Recovers dim troughs \\
+    Weakness    & Inherits threshold error; blunts peaks & Sensitive to step limit & Can leak; area capped \\
+    Always present & Yes & No & No \\
+    \bottomrule
+    \end{tabular}
+    \caption{The three tracing methods compared.}
+    \label{tab:methods}
+    \end{table}
+
+  \subsection{Debugging aids}
+    Setting the module-level flag \fn{SHOW\_GROW\_DEBUG\_PLOTS}, or passing
+    \fn{grow\_debug\_plots=True} to \fn{segment\_refinement}, produces
+    diagnostic figures of the region-growing pipeline and of the traced overlays.
+    \fn{ray\_trace\_waveform\_segmentation} has an equivalent
+    \fn{debug\_plots} argument showing the clustered signal mask, the yellow
+    exclusion, the accepted three-pixel runs and the final trace. These are off
+    by default because the batch path saves a fixed set of figures instead.
+
+\newpage
+\section{Stage 5: Digitisation and Calibration}
+\label{sec:digitisation}
+  Digitisation converts a set of image coordinates into a physical waveform. The
+  two modalities use different functions for this,
+  \fn{plot\_digitized\_data\_single\_axis} for raster images and
+  \fn{plot\_digitized\_data\_dicom} for DICOM, but both return the same
+  seven-element tuple:
+
+  \begin{lstlisting}[language=Python]
+Xplot, Yplot, Ynought, Xplot_o, Yplot_o, Xplot_g, Yplot_g
+  \end{lstlisting}
+  where the unsuffixed pair is the primary series, \fn{\_o} the overlay and
+  \fn{\_g} the region-grow series. \fn{Ynought} carries the zero-velocity
+  reference. Keeping the signature identical is what allows the two branches to
+  reconverge for the remaining stages.
+
+  \subsection{Condensing the curve to one sample per column}
+    Both branches begin with the same reduction. A trace arrives as a list of
+    $(\text{row}, \text{col})$ pairs which may contain several rows for one
+    column. The pairs are swapped to $(\text{col}, \text{row})$, grouped by
+    column with \fn{pandas.groupby}, and the mean row per column is taken, after
+    which the result is sorted by column. This guarantees that the digitised
+    series is single-valued in time, which every downstream operation assumes.
+
+  \subsection{Raster: choosing an axis and mapping rows to velocities}
+    \fn{plot\_digitized\_data\_single\_axis} calibrates from a single vertical
+    axis. A side is usable if it carries at least two ticks and its value and
+    position counts agree. The choice is made as follows: if only one side is
+    usable, it is used; if both are usable, \fn{validate\_axis\_pair} is consulted
+    and the side with more ticks is selected either way, with a warning logged when
+    the sides disagree. If neither side is usable the function returns empty
+    series and logs an error. In other words tick count, not agreement, decides
+    the outcome; agreement only affects logging. This is a deliberate choice to
+    keep processing possible on partially labelled scans, and the disagreement
+    warning is the signal to inspect such a scan manually.\\
+    \\
+    Calibration itself is a two-point fit rather than a least-squares fit over all
+    ticks. The $(\text{row}, \text{value})$ pairs are sorted by row and the line is
+    taken through the extreme pair only:
+
+    \[
+      a = \frac{v_{n-1} - v_0}{y_{n-1} - y_0}, \qquad
+      b = v_0 - a\,y_0, \qquad
+      \text{value} = a\,y + b .
+    \]
+    Using the endpoints maximises the lever arm and so minimises the effect of
+    quantisation on the slope, but it also means a single mislocated endpoint tick
+    corrupts the entire scale. This is precisely the failure that
+    \fn{validate\_axis\_ticks} exists to prevent, which is why its endpoint-drop
+    rules matter more than they might appear to.\\
+    \\
+    Interior ticks are used for validation but not for the fit; the code proceeds
+    only if there are at least two ticks and the first and last rows differ.
+
+  \subsection{Raster: the arbitrary time axis}
+    There is no equivalent of the vertical ticks for the horizontal axis, so the
+    raster branch does not attempt to calibrate time at this point. Instead the
+    column indices are normalised to the unit interval,
+
+    \[
+      X_i = \frac{x_i - x_{\min}}{x_{\max} - x_{\min}} \in [0,1],
+    \]
+    and the axis is labelled \emph{arbitrary time scale}. The same $x_{\min}$ and
+    $x_{\max}$ from the primary series are applied to the overlay and grow series,
+    so all three share one time base and remain directly comparable.
+
+    \paragraph{Orientation correction.} If the mean of the primary series is
+    negative the sign of all three series is flipped. This handles displays that
+    plot flow below the baseline, and applying it to all three series together
+    preserves their alignment.
+
+  \subsection{Raster: time-axis calibration from heart rate}
+    Real time is recovered later, from the printed heart rate. The reasoning is
+    that the mean interval between beat feet on the arbitrary axis must correspond
+    to the true cardiac period $60/\mathrm{HR}$, giving a scale factor
+
+    \[
+      s = \frac{60/\mathrm{HR}}{T_{\text{arb}}},
+      \qquad
+      T_{\text{arb}} = \frac{x[f_{n-1}] - x[f_0]}{n_f - 1},
+    \]
+    where $f$ are the detected foot indices. \fn{digitized\_hr\_scale\_factor\_for\_raster}
+    computes this from the ray series and the OCR dataframe, and
+    \fn{scale\_raster\_digitized\_x} applies it to each series in turn. When the
+    heart rate is missing or non-positive, or when foot spacing cannot be
+    determined, the factor is $1.0$ and the axis remains arbitrary.\\
+    \\
+    This is the single most important dependency between stages: OCR failure on
+    the heart rate line silently leaves the time axis uncalibrated. It also means
+    the raster time axis inherits any error in the printed heart rate, which is
+    why \fn{refine\_hr\_from\_local\_roi} is worth its extra OCR pass.
+
+  \subsection{DICOM: mapping pixels using physical deltas}
+    The DICOM branch needs no fitting because the display geometry is recorded in
+    the header. \fn{\_dicom\_xy\_from\_curve\_coords} maps each condensed point
+    directly:
+
+    \begin{align*}
+      x_{\text{ref}} &= \text{\fn{RegionLocationMinX0}} + \text{\fn{ReferencePixelX0}}, \\
+      y_{\text{ref}} &= \text{\fn{RegionLocationMinY0}} + \text{\fn{ReferencePixelY0}}, \\
+      X_i &= \text{\fn{ReferencePixelPhysicalValueX}}
+             + (c_i - x_{\text{ref}})\cdot \delta_x, \\
+      Y_i &= \text{\fn{ReferencePixelPhysicalValueY}}
+             + (r_i - y_{\text{ref}})\cdot \delta_y .
+    \end{align*}
+    Here $\delta_x$ is \fn{PhysicalDeltaX} and
+    $\delta_y = -\lvert \text{\fn{PhysicalDeltaY}} \rvert$. The reference pixel offsets
+    default to zero, the reference physical values to zero and the deltas to one
+    when absent. Crucially, the sign of $\delta_y$ is forced negative regardless
+    of what the header states, because image rows
+    increase downwards while velocity increases upwards. Consequently the DICOM
+    branch has no need for the negative-mean inversion used on raster images, and
+    does not apply it.\\
+    \\
+    \fn{Ynought} is set to \fn{[ReferencePixelPhysicalValueY]}, defaulting to
+    $0.0$, whereas the raster branch always returns \fn{[0.0]}.\\
+    \\
+    The essential consequence is that DICOM $X$ is in physical units immediately,
+    with no dependence on OCR, on beat detection or on the printed heart rate.
+    Table~\ref{tab:calibcompare} summarises the difference.
+
+    \begin{table}[h]
+    \centering
+    \small
+    \begin{tabular}{@{}p{0.20\textwidth}p{0.36\textwidth}p{0.36\textwidth}@{}}
+    \toprule
+    & Raster & DICOM \\
+    \midrule
+    Velocity axis & Two-point fit through OCR-read ticks &
+      Reference pixel plus \fn{PhysicalDeltaY} \\
+    Time axis & Normalised to $[0,1]$, later scaled by heart rate &
+      Reference pixel plus \fn{PhysicalDeltaX}, physical at once \\
+    Requires OCR & Yes, for both ticks and heart rate & No \\
+    \fn{Ynought} & \fn{[0.0]} & \fn{ReferencePixelPhysicalValueY} \\
+    Sign handling & Inverted if mean is negative & \fn{PhysicalDeltaY} forced negative \\
+    Failure mode & No ticks, so no calibration at all & Missing tags, so arithmetic error \\
+    \bottomrule
+    \end{tabular}
+    \caption{Calibration compared across the two modalities.}
+    \label{tab:calibcompare}
+    \end{table}
+
+  \subsection{Shape-preserving smoothing}
+    Digitised traces retain single-pixel jitter, which would otherwise be
+    amplified by the derivative-based foot detection of
+    Section~\ref{sec:beats}. \fn{\_smooth\_1d\_digitized\_shape\_preserving}
+    addresses this in two steps: a Hampel filter with a half-window of $2$ and a
+    threshold of $3\sigma$ removes isolated spikes, then a Savitzky--Golay filter
+    smooths the remainder. The window is $10\%$ of the series length clamped to
+    $[7, 21]$ and forced odd, with polynomial order $3$ reduced if the window is
+    too short. A rolling median is used as a fallback when the window would be
+    smaller than five samples or the filter raises.\\
+    \\
+    A Savitzky--Golay filter is chosen over a moving average because it fits a
+    local polynomial and therefore preserves peak height and curvature, which is
+    essential when the peak values themselves are the measurements of interest.
+    Smoothing is applied only to the ray series and to the grow series, since the
+    morphological trace is already smooth by construction.
+
+  \subsection{Primary and overlay series: an asymmetry between entry points}
+  \label{sec:asymmetry}
+    Both digitisation functions accept a primary curve and an overlay, with a flag
+    \fn{overlay\_is\_ray} declaring which is which. The two entry points populate
+    these arguments in opposite orders:
+
+    \begin{itemize}
+      \item \fn{single\_image\_processing.py} passes the \textbf{morphological}
+        trace as primary with \fn{overlay\_is\_ray=True}.
+      \item \fn{segment\_files.py} passes the \textbf{ray} trace as primary with
+        \fn{overlay\_is\_ray=False}.
+    \end{itemize}
+    Plot colours and legends are driven by the flag and so remain correct in both
+    cases. Metrics are also unaffected on the raster path, because
+    \fn{plot\_correction} receives each series explicitly. On the DICOM path,
+    however, \fn{waveform\_metrics\_from\_digitized} treats its primary
+    \fn{(Xplot, Yplot)} argument as the ray series when labelling the output
+    columns. The consequence is that for a DICOM file the column headed
+    \emph{Digitized Value (ray)} contains morphological metrics when the
+    single-image entry point is used, and ray metrics when the batch entry point
+    is used. The numbers are correct in both cases; only the attribution differs.
+    This is worth resolving before the column labels are relied upon
+    quantitatively.
+    %TODO: This probably isn't relevant at the moment since we only use this for debugging.
+
+\newpage
+\section{Stage 6: Beat Detection and Haemodynamic Indices}
+\label{sec:beats}
+  With a calibrated waveform in hand, the pipeline identifies individual cardiac
+  cycles and reduces them to the standard haemodynamic indices. The beat detection
+  logic is shared between modalities and lives in \fn{\_beat\_detection\_pass\_feet};
+  only the wrapper differs.
+  \fn{\_waveform\_peaks\_troughs\_values\_from\_physical\_x} is used when $x$ is
+  already physical, as on the DICOM path, and
+  \fn{\_digitized\_peaks\_metrics\_timescaled} when $x$ is arbitrary and must be
+  scaled by heart rate, as on the raster path.
+
+  \subsection{Why feet rather than troughs delimit a beat}
+    A beat could in principle be delimited by successive minima, but the diastolic
+    minimum of a Doppler envelope is a broad, flat feature whose location is
+    sensitive to noise. The \emph{foot} — the onset of the systolic upstroke — is
+    by contrast a sharp change in curvature and can be located far more
+    repeatably. The pipeline therefore detects peaks first, uses them to anchor a
+    search for feet, and only then finds the extrema within each foot-to-foot
+    interval.
+
+  \subsection{Peak proposal}
+    Peaks are proposed with \fn{scipy.signal.find\_peaks} using two constraints
+    derived from the signal itself rather than fixed thresholds:
+    \begin{itemize}
+      \item \textbf{Minimum separation.} A physiological upper bound of $200$\,bpm
+        implies a minimum spacing of $0.3$\,s, converted to samples as
+        $\max(1, \lfloor 0.3 / \Delta x \rfloor)$ where $\Delta x$ is the median
+        sample spacing. Where $x$ is still arbitrary, the cruder
+        $\max(1, n/15)$ is used, which assumes no more than fifteen beats on
+        screen.
+      \item \textbf{Prominence.} Set to a quarter of the peak-to-peak amplitude
+        within \fn{\_beat\_detection\_pass\_feet}. Scaling with amplitude makes the
+        criterion insensitive to the absolute velocity scale.
+    \end{itemize}
+    On the raster path this is done twice. The first pass runs on the arbitrary
+    axis purely to obtain the mean foot spacing needed for the heart-rate scale
+    factor; the second runs on the scaled axis with the physiological
+    $0.3$\,s separation, and replaces the first result if it yields at least two
+    feet and at least one peak and trough. The second pass cannot change the
+    indices, since linear scaling of $x$ does not move samples, but it does change
+    the separation constraint expressed in samples and therefore which peaks
+    survive.
+
+  \subsection{Foot detection}
+    \fn{\_detect\_feet\_indices\_from\_peaks} locates one foot per anchoring peak
+    using the derivatives of the envelope. For each peak:
+
+    \begin{enumerate}
+      \item Define a backward search window covering the last
+        \fn{FOOT\_SEARCH\_FRACTION} $=0.50$ of the preceding peak-to-peak
+        interval, tightened by $0.10$ for all beats after the first, and ending
+        \fn{FOOT\_MIN\_SAMPLES\_BEFORE\_PEAK} $=3$ samples short of the peak. For
+        the first peak the interval is estimated from the mean of the
+        \emph{other} peak intervals, which is more stable than the first observed
+        gap; the beat is skipped if the window would extend before the start of
+        the signal.
+      \item Smooth the window with a Savitzky--Golay filter of window at most
+        \fn{FOOT\_DERIV\_SMOOTH\_WINDOW\_MAX} $=11$ and order
+        \fn{FOOT\_DERIV\_SMOOTH\_POLYORDER} $=2$.
+      \item Resample onto a uniform grid in $x$ before differentiating, so that
+        irregular sample spacing cannot distort the gradients.
+      \item Take the maximum of the second derivative as the upstroke anchor, the
+        point of greatest positive curvature.
+      \item Walk backwards from that anchor along the first derivative and accept
+        the first low-slope point as the foot.
+    \end{enumerate}
+
+    A height guard rejects candidates that sit too high on the upstroke:
+    \[
+      y_{\text{foot}} \leq y_{\text{trough}}
+        + \fn{FOOT\_MAX\_REL\_HEIGHT}\,(y_{\text{peak}} - y_{\text{trough}}),
+      \qquad \fn{FOOT\_MAX\_REL\_HEIGHT} = 0.55 .
+    \]
+    Feet are returned sorted and deduplicated. Beat detection is abandoned, with
+    an informational log entry, if fewer than two feet are found, since a single
+    foot delimits no beat.
+
+  \subsection{Per-beat extrema}
+    \fn{\_peaks\_troughs\_from\_feet} treats beat $i$ as the half-open interval
+    $[f_i, f_{i+1})$ and extracts one peak and one trough from each. A rolling
+    median of window $5$ stabilises the selection. Where one of the originally
+    proposed peaks falls inside the beat, the tallest such anchor is used in
+    preference to the segment maximum, which keeps the reported peak consistent
+    with the peak that defined the beat. The trough is then constrained to lie
+    \emph{after} the peak, reflecting the physiological ordering of systole and
+    diastole, and only falls back to the beat-wide minimum if the post-peak
+    segment is empty. Intervals of three samples or fewer are skipped.
+
+  \subsection{Signal quality filtering}
+    \fn{\_sqi\_template\_correlation\_from\_feet} implements a template-matching
+    quality index. Each beat is resampled to $200$ points, a median template is
+    formed across all valid beats, and a beat is accepted if its Pearson
+    correlation with the template is at least $0.85$. Beats that are degenerate —
+    shorter than three samples, or with standard deviation below $10^{-10}$ — are
+    marked invalid. Two fallbacks prevent the filter from discarding everything: if
+    no beat is valid, or if the template itself is flat, or if every beat is
+    rejected, all beats are accepted.
+
+    \textbf{This filter is disabled by default.} \fn{USE\_SQI\_FILTER} is
+    \fn{False} at \fn{general\_functions.py:276}, so every detected beat currently
+    contributes to the reported metrics. The mechanism is complete and gated by a
+    single flag, so enabling it is a one-line change, but the effect on reported
+    values has not been characterised and it should be treated as experimental.
+
+  \subsection{Index formulae}
+    The indices themselves live in \fn{hemodynamic\_indices.py} as pure functions,
+    deliberately separated from the image processing so that they can be tested
+    and audited independently. Peak systolic and end-diastolic velocities are the
+    means over all accepted beats,
+    \[
+      PS = \operatorname{mean}\big(y[\text{peaks}]\big), \qquad
+      ED = \operatorname{mean}\big(y[\text{troughs}]\big),
+    \]
+    with $ED$ replaced by machine epsilon if it is exactly zero, guarding the
+    divisions that follow. Let $\bar v = \operatorname{mean}(y)$ over
+    \emph{all} envelope samples. Then:
+
+    \begin{align*}
+      S/D  &= PS / ED \\
+      RI   &= \frac{PS - ED}{PS}
+        && \text{\fn{resistive\_index\_from\_ps\_ed}} \\
+      TA_{\max} &= \bar v
+        && \text{\fn{tamax\_from\_envelope\_temporal\_mean}} \\
+      PI   &= \frac{PS - ED}{\bar v}
+        && \text{\fn{pulsatility\_index\_from\_ps\_ed\_and\_mean\_velocity}}
+    \end{align*}
+
+    All are rounded to two decimal places, and each guards against a zero or
+    non-finite denominator by returning $0.0$.
+
+    Two points deserve emphasis. First, $TA_{\max}$ is the temporal mean of the
+    whole digitised envelope, not of complete beats only, so a partial beat at
+    either end of the trace biases both $TA_{\max}$ and $PI$; the batch plots shade
+    incomplete beats for exactly this reason. Second,
+    \fn{tamax\_from\_ps\_ed\_approximation}, which computes
+    $(PS + 2\,ED)/3$, is a legacy surrogate used only by the OCR consistency
+    checks of Section~\ref{sec:ocr}, where no envelope is available. It is not used
+    on any digitised path, and the two must not be conflated when comparing
+    digitised and OCR values.
+
+    Heart rate is not computed from the digitised trace. On the raster path it is
+    an input, read by OCR and used to calibrate time; on the DICOM path it is
+    neither needed nor reported.
+
+\newpage
+\section{Stage 7: Model Comparison and Selection}
+\label{sec:selection}
+  Stage 4 produces three candidate traces and the pipeline must return one. The
+  criterion is agreement with the machine's own printed measurements: whichever
+  trace reproduces the OCR values most closely is assumed to have segmented the
+  envelope most faithfully. This makes the OCR stage not merely a reporting
+  convenience but the arbiter of segmentation quality, and it is why an
+  \fn{Fail} flag from Section~\ref{sec:ocr} degrades the result even though the
+  segmentation itself succeeded.
+
+  \emph{This stage applies to raster images only.} The DICOM path has no
+  independent ground truth and is discussed at the end of the section.
+
+  \subsection{Mapping digitised values into the metric table}
+    \fn{plot\_correction} inserts three empty columns into the OCR dataframe at
+    positions 3 to 5, named \emph{Digitized Value (ray)},
+    \emph{Digitized Value (morph)} and \emph{Digitized Value (grow)}, so that they
+    sit beside the extracted \texttt{Value} column for visual comparison.
+
+    Metrics are then computed for each series — the ray series through
+    \fn{plot\_correction} itself and the other two through
+    \fn{\_digitized\_peaks\_metrics\_timescaled}, which reuses the primary
+    series' arbitrary period so that all three share one time base. Each value is
+    written into the row matched by \fn{\_df\_word\_metric\_mask}, which performs a
+    substring match on the \texttt{Word} column with a dedicated regular
+    expression for ophthalmic labels. The metric words are
+    \texttt{PS, ED, S/D, RI, TA, PI} in general, and
+    \texttt{PS, ED, PS/ED, RI, PI} for ophthalmic scans, which report no
+    time-averaged velocity.
+
+    The OCR \texttt{Value} column is never overwritten. It remains the reference
+    against which the three digitised columns are scored.
+
+  \subsection{Agreement scoring}
+    \fn{digitized\_comparison.py} classifies each metric as a velocity or a ratio
+    via \fn{metric\_kind\_for\_digitized\_row}, because an absolute error of
+    $0.05$ means something very different for a velocity in centimetres per second
+    than for a dimensionless index. Ratio metrics are those whose \texttt{Word}
+    contains \texttt{PS/ED}, \texttt{ED/PS}, \texttt{S/D}, \texttt{PI} or
+    \texttt{RI}; velocity metrics are those containing \texttt{TA}, \texttt{PS} or
+    \texttt{ED}. The ratio tests are ordered before the bare \texttt{PS} and
+    \texttt{ED} tests so that a compound label is not misclassified.
+
+    Each cell is then assigned a colour. Let $t$ be the OCR value and $p$ the
+    digitised value. For velocities, comparison is on magnitudes, since either may
+    carry a spurious sign:
+    \[
+      AE = \big\lvert\, \lvert p \rvert - \lvert t \rvert \,\big\rvert,
+      \qquad
+      PE = 100\,\frac{AE}{\lvert t \rvert}\ \ (\lvert t \rvert > 0).
+    \]
+
+    \begin{table}[h]
+    \centering
+    \small
+    \begin{tabular}{@{}lll@{}}
+    \toprule
+    Colour & Velocity rule & Ratio rule \\
+    \midrule
+    Green & $AE \leq 5$ \textbf{and} $PE \leq 5\%$        & $AE \leq 0.05$ \\
+    Amber & otherwise                                      & $0.05 < AE \leq 0.10$ \\
+    Red   & $AE > 10$ \textbf{or} $PE > 10\%$              & $AE > 0.10$ \\
+    \bottomrule
+    \end{tabular}
+    \caption{Traffic-light thresholds as implemented in
+      \fn{velocity\_digitized\_style} and \fn{ratio\_digitized\_style}.}
+    \label{tab:trafficlight}
+    \end{table}
+
+    When $\lvert t \rvert$ is within $10^{-12}$ of zero the percentage error is
+    undefined, and the cell is green only if $AE < 10^{-9}$ and red otherwise.
+
+    \begin{warningbox}
+    The docstrings in \fn{digitized\_comparison.py} do not match the code. The
+    module docstring and \fn{velocity\_digitized\_style} state green at
+    $AE \leq 5$ with $PE \leq 10\%$ and red at $AE > 15$ or $PE > 20\%$, whereas
+    the implementation uses $PE \leq 5\%$ for green and $AE > 10$ or $PE > 10\%$
+    for red. The implemented rules are therefore stricter than documented. The
+    values in Table~\ref{tab:trafficlight} reflect the code. This should be
+    reconciled, since the thresholds determine model selection and not merely cell
+    colour.
+    \end{warningbox}
+
+  \subsection{Selecting the returned model}
+    \fn{traffic\_light\_counts\_by\_metric\_kind} tallies each digitised column
+    into two triples of green, amber and red counts, one for velocities and one
+    for ratios, skipping any row whose OCR value or digitised value is missing,
+    unparseable or non-finite. \fn{select\_best\_digitized\_model\_for\_image}
+    then ranks the columns by the key
+
+    \begin{lstlisting}[language=Python]
+(velocity_greens, ratio_greens,
+ -velocity_ambers, -ratio_ambers,
+ -velocity_reds,   -ratio_reds)
+    \end{lstlisting}
+
+    sorted in descending order. Velocity greens dominate because peak systolic and
+    end-diastolic velocities are the primary clinical measurements and the ratios
+    are derived from them; a trace that gets the velocities right will generally
+    get the ratios right, whereas the converse does not hold. Ambers are penalised
+    before reds so that a column with several near misses is preferred to one that
+    is confidently wrong. Two fallbacks apply: if no column scored any cell, the
+    first column holding any numeric value is taken; and if no candidate column
+    exists at all, \texttt{"ray"} is returned.
+
+    \fn{finalize\_image\_digitized\_model\_choice} applies the decision. It
+    consults the selector, then requires the chosen series to have at least two
+    points with matching $x$ and $y$ lengths; if not, it falls back through ray,
+    morph and grow in that order until a usable series is found. It records the
+    outcome in a \texttt{Returned model} column as
+    \fn{returned\_model\_cell\_value}, for example \texttt{"morph algorithm"}, and
+    returns the selected $(x, y)$ pair. When no dataframe is supplied, or the
+    dataframe lacks the ray column, it defaults to ray without scoring.
+
+    The full raster ordering is therefore: digitise with
+    \fn{plot\_digitized\_data\_single\_axis}; populate the digitised columns with
+    \fn{plot\_correction}; compute and apply the heart-rate scale factor to all
+    three series; and finally select with
+    \fn{finalize\_image\_digitized\_model\_choice}.
+
+  \subsection{DICOM: no independent ground truth}
+    The DICOM path calls \fn{waveform\_metrics\_from\_digitized} instead of
+    \fn{plot\_correction}, and neither
+    \fn{select\_best\_digitized\_model\_for\_image} nor
+    \fn{finalize\_image\_digitized\_model\_choice} is invoked. There is no
+    \texttt{Returned model} column, and the trace returned is simply the primary
+    series supplied by the caller — which, per Section~\ref{sec:asymmetry},
+    differs between the two entry points.
+
+    A structural consequence deserves attention. Because DICOM files carry no
+    printed metric panel in the extracted region, the \texttt{Value} column of the
+    resulting dataframe is populated with the computed primary metrics rather than
+    with an independent measurement. The HTML report nonetheless applies the same
+    traffic-light styling, comparing each digitised column against
+    \texttt{Value}. The primary column therefore always scores perfect green, since
+    it is being compared with itself, and the other two columns are scored against
+    the primary rather than against any ground truth. The colours remain useful as
+    an indication of agreement \emph{between} the three segmentation methods, but
+    they must not be read as accuracy.
+
+\newpage
+\section{Batch Pipeline and Outputs}
+\label{sec:batch}
+  The batch entry point is \fn{usseg.main.main}, which composes three stages, each
+  wrapped in the profiling helper \fn{prof} so that a
+  \texttt{cProfile} report is written per stage:
+
+  \begin{lstlisting}[language=Python]
+usseg.setup_tesseract()
+filenames = prof(usseg.get_likely_us, root_dir)
+prof(usseg.segment, filenames)
+prof(usseg.generate_html_from_pkl)
+  \end{lstlisting}
+
+  The stages communicate through pickle files rather than in memory, which means
+  each can be re-run independently — a useful property when only the report needs
+  regenerating after a long segmentation run.
+
+  \subsection{File discovery: \fn{get\_likely\_us}}
+    \fn{organise\_files.get\_likely\_us} walks \fn{root\_dir} with
+    \fn{os.walk}, collecting files with extensions \fn{.jpg}, \fn{.png},
+    \fn{.dcm} and \fn{.dicom}, and tests each with \fn{check\_file\_for\_us}.
+    The two modalities are triaged differently:
+
+    \begin{itemize}
+      \item \textbf{DICOM} files are accepted unconditionally. The container
+        format is itself sufficient evidence that the file is an ultrasound.
+      \item \textbf{JPG and PNG} files are passed to \fn{scan\_type\_test}, which
+        performs a cheap OCR probe and returns \fn{Fail} $=0$ for a probable
+        Doppler scan. This is necessary because a directory of exported images
+        typically also contains B-mode frames, report pages and screenshots.
+    \end{itemize}
+
+    Accepted files are grouped into a dictionary keyed by a patient identifier
+    scraped from the file path with a regular expression, and that dictionary is
+    pickled to \fn{likely\_us\_images}. Two details are worth recording. First,
+    the identifier pattern differs by modality: \fn{\textbackslash d\{4\}} for
+    DICOM and \fn{\textbackslash d\{3\}} for raster, so the same directory tree can
+    yield inconsistent grouping. Second, the function returns a \emph{flattened}
+    list of paths, discarding the grouping, which is preserved only in the pickle.
+    Downstream code therefore processes scans independently, with no per-patient
+    aggregation.
+
+    An optional \fn{use\_parallel} flag routes discovery through a
+    \fn{ThreadPoolExecutor}. It defaults to \fn{False} and \fn{main} does not
+    enable it. Since the probe is dominated by Tesseract calls, which release the
+    interpreter lock, threading would be expected to help; the conservative default
+    presumably reflects Tesseract's thread-safety being uncertain in this
+    configuration.
+
+  \subsection{Per-scan processing: \fn{segment}}
+    \fn{segment\_files.segment} accepts a list of paths, a single path, a
+    dictionary, or a path to a pickle, normalising all of them to a list. Each
+    scan is dispatched by extension to the DICOM or raster branch already described
+    in Sections~\ref{sec:coarse} to~\ref{sec:selection}.
+
+    \paragraph{Output naming.} Figures are written with the prefix
+    \fn{output\_dir + f"\{idx\}\_\{base\_name\}"}. The loop index is included
+    deliberately: DICOM exports frequently reuse basenames such as
+    \fn{001.dcm} across patient folders, and without the index later scans would
+    silently overwrite earlier ones.
+
+    \paragraph{The parallel-list invariant.} The function accumulates five lists —
+    \fn{scan\_display\_paths}, \fn{Digitized\_scans}, \fn{Annotated\_scans},
+    \fn{Text\_data} and \fn{Mean\_wave\_scans} — which must remain index-aligned,
+    because the report pairs them positionally with \fn{zip}. Every failure branch
+    therefore appends \fn{None} rather than skipping, and this is the reason the
+    exception handlers are structured as they are. A branch that returned early
+    without appending would silently shift every subsequent row of the report
+    against the wrong scan.
+
+    \paragraph{Failure counting.} \fn{Fail} is incremented when digitisation
+    raises. It is not aggregated into a run-level summary, so the count of failed
+    scans must be recovered from the log or by counting \fn{None} entries in the
+    pickle. A per-run summary would be a worthwhile addition.
+
+    \paragraph{Memory hygiene.} After each scan the code calls
+    \fn{plt.close("all")}, which is essential: the pipeline draws into figures 1
+    and 2 by number, and without closing them the axes of successive scans would
+    accumulate. A subsequent loop attempts to delete named locals through
+    \fn{exec("del \%s" \% i)}. This has no effect in Python 3, because
+    \fn{exec} cannot bind or unbind local variables in a function scope; it is dead
+    code and can be removed.
+
+  \subsection{Rendered outputs}
+    For each scan the batch path may write four PNG files into
+    \fn{output\_dir}:
+
+    \begin{table}[h]
+    \centering
+    \small
+    \begin{tabular}{@{}lp{0.55\textwidth}@{}}
+    \toprule
+    Suffix & Contents \\
+    \midrule
+    \fn{\_Source.png}     & DICOM only: the extracted Doppler frame, saved because a
+                            browser cannot display raw \fn{.dcm} bytes \\
+    \fn{\_Annotated.png}  & Figure 1: the original scan overlaid with the ROIs,
+                            detected ticks and the three traces \\
+    \fn{\_Digitized.png}  & Figure 2: the calibrated waveforms with beat markers,
+                            saved at 900\,dpi \\
+    \fn{\_MeanWaves.png}  & Mean beat per method, via
+                            \fn{save\_mean\_waves\_ray\_morph\_grow\_figure} \\
+    \bottomrule
+    \end{tabular}
+    \caption{Per-scan figures written by the batch pipeline.}
+    \end{table}
+
+    Figure 2 is saved by explicit number, \fn{plt.figure(2).savefig(...)}, because
+    annotation may have left figure 1 current. The mean-wave figure is wrapped in
+    its own handler and contributes \fn{None} on failure, so a mean-beat problem
+    cannot cost the scan its other outputs.
+
+  \subsection{Serialised artifacts}
+    \fn{segment} pickles the five lists to \fn{segmented\_data} as a single
+    list, in the order
+
+    \begin{lstlisting}[language=Python]
+[scan_display_paths, Digitized_scans, Annotated_scans,
+ Text_data, Mean_wave_scans]
+    \end{lstlisting}
+
+    and returns the same data to its caller. Passing \fn{pickle\_path=False}
+    suppresses the write, which is what the single-image and test paths do. Note
+    that \fn{Text\_data} holds live \fn{pandas} dataframes, so the pickle is
+    coupled to the pandas version used to write it.
+
+  \subsection{HTML report}
+    \fn{visualisation\_html.generate\_html\_from\_pkl} reads the pickle and
+    calls \fn{generate\_html}, writing \fn{generated\_segmented\_data.html}
+    into the working directory. It tolerates a four-element pickle from an earlier
+    version by synthesising a list of \fn{None} for the mean-wave column.
+
+    Each scan becomes one horizontally scrolling row of four images followed by its
+    metric table, and every image is inlined as a base64 data URI so that the
+    report is a single self-contained file. The trade-off is size: base64 inflates
+    each image by roughly a third and nothing is shared between rows, so a report
+    over a large batch becomes slow to open. Note also that the MIME type is
+    hard-coded to \fn{image/png} even for JPEG inputs; browsers sniff the content
+    and render it regardless, but the declaration is incorrect.
+
+    Table cells in the three digitised columns are coloured by
+    \fn{digitized\_cell\_background\_style} using the rules of
+    Table~\ref{tab:trafficlight}, with empty cells left white. The styling call is
+    wrapped in a bare \fn{except} that falls back to an unstyled cell, so a
+    non-numeric value degrades the colour rather than the report. Column widths are
+    estimated from the longest string in each column, which keeps the wide metric
+    tables legible without a stylesheet.
+
+\newpage
+\section{Error Handling and Known Failure Modes}
+\label{sec:failures}
+  \subsection{Degradation strategy}
+    The pipeline is designed to degrade rather than to abort. Each stage is
+    wrapped in its own handler, and a failure removes only the information that
+    stage would have contributed. The rationale is that a batch of several hundred
+    scans will always contain some that fall outside the assumptions of the
+    layout, and a single such scan must not cost the operator the whole run.
+
+    The cascade of degradation is as follows:
+
+    \begin{table}[h]
+    \centering
+    \small
+    \begin{tabular}{@{}p{0.28\textwidth}p{0.30\textwidth}p{0.34\textwidth}@{}}
+    \toprule
+    Stage fails & Immediate effect & Downstream consequence \\
+    \midrule
+    One axis side & That side's ticks are \fn{None} &
+      Calibration proceeds from the other side \\
+    Both axis sides & No calibration possible &
+      Empty digitised series; no metrics \\
+    OCR heart rate & Scale factor is $1.0$ &
+      Time axis stays arbitrary; velocities unaffected \\
+    OCR overall (\fn{Fail}) & \fn{plot\_correction} skipped &
+      No digitised columns, so model selection defaults to ray \\
+    One tracing method & Its series is empty &
+      Selection falls back through ray, morph, grow \\
+    Digitisation & \fn{None} appended to all output lists &
+      Report row shows blanks but stays aligned \\
+    Mean-wave figure & \fn{None} in that column only &
+      Other three figures still written \\
+    \bottomrule
+    \end{tabular}
+    \caption{How failure at each stage propagates.}
+    \end{table}
+
+  \subsection{Commonly observed failures}
+    Two exceptions dominate the console output of a healthy run and are worth
+    recognising on sight, because both are expected rather than pathological.
+
+    \paragraph{\texttt{ValueError: attempt to get argmax of an empty sequence}.}
+    Raised inside \fn{search\_for\_ticks} when the column profile for one side has
+    no peaks, that is when the scan prints no ticks on that side. Newer ophthalmic
+    scans label the right axis only, so this fires once per image for the left
+    side. It is caught, and the pipeline calibrates from the right axis alone.
+
+    \paragraph{\texttt{ValueError: XA must be a 2-dimensional array}.}
+    Raised by \fn{scipy.spatial.distance.cdist} inside
+    \fn{search\_for\_labels} when there are no label centres to pair, which
+    follows from the same cause. Also caught.
+
+    Because \fn{segment\_files.py} calls \fn{traceback.print\_exc()} in these
+    handlers as well as logging, both produce full tracebacks on stderr for every
+    scan processed. The handling is correct but the reporting is misleading: a
+    successful run looks like a failing one. Downgrading these two expected cases
+    to a single-line debug message, while keeping full tracebacks for genuinely
+    unexpected exceptions, would make the log usable as a monitoring tool.
+
+    \paragraph{\texttt{FutureWarning} from \fn{binary\_erosion}.}
+    \fn{\_shrink\_seed\_for\_region\_grow} calls
+    \fn{morphology.binary\_erosion}, deprecated in scikit-image 0.26 and due for
+    removal in 0.28. Behaviour is unchanged for now; the call should become
+    \fn{morphology.erosion} with the same footprint.
+
+  \subsection{Limitations}
+    \begin{itemize}
+      \item \textbf{Layout dependence.} Panel position, the yellow annotation
+        colour and the tick-labelling convention are assumed throughout. The
+        spatial pre-mask in \fn{text\_from\_greyscale} and the ROI fractions in
+        \fn{extract\_dicom\_label\_text} are tuned to the machines in use and would
+        need revisiting for another vendor.
+      \item \textbf{Time calibration depends on OCR.} On raster images real time
+        exists only if the printed heart rate is read correctly, and the pipeline
+        cannot detect a plausible-but-wrong heart rate.
+      \item \textbf{Single spectral region.} \fn{extract\_dicom\_metadata} takes
+        the first matching pulsed-wave region and
+        \fn{extract\_doppler\_from\_dicom} handles only single-frame
+        $(H,W)$ and $(H,W,3)$ arrays, raising on multiframe data.
+      \item \textbf{No independent validation on DICOM.} With no printed metric
+        panel, the traffic-light colours measure inter-method agreement rather than
+        accuracy, and no model selection is performed.
+      \item \textbf{Endpoint-only axis fit.} A single surviving bad endpoint tick
+        rescales every velocity on the scan.
+      \item \textbf{Partial beats bias means.} $TA_{\max}$ and $PI$ average the
+        whole envelope, including incomplete beats at either end.
+      \item \textbf{Quality filtering inactive.} \fn{USE\_SQI\_FILTER} is
+        \fn{False}, so no beat is excluded on quality grounds.
+    \end{itemize}
+
+\newpage
+\section{Implementation Notes}
+  \subsection{Performance considerations}
+    Runtime is dominated by Tesseract. The threshold sweep in
+    \fn{search\_for\_labels} may invoke OCR up to eighteen times per axis, and the
+    early stop on divisibility by five exists primarily to cut that cost. Whole-scan
+    OCR runs twice more in \fn{text\_from\_greyscale}, once through
+    \fn{image\_to\_data} for boxes and once through \fn{image\_to\_string} for
+    lines, plus a further constrained pass in \fn{refine\_hr\_from\_local\_roi}.
+
+    \fn{colour\_extract\_vectorized} replaced a per-pixel implementation with
+    NumPy array arithmetic and is no longer a significant cost;
+    \fn{colour\_extract} remains in the module and is unused. Discovery can be
+    threaded through \fn{use\_parallel}, though this is off by default.
+
+    \fn{main} wraps each stage in \fn{prof}, writing a \texttt{cProfile} report
+    named after the function, which is the intended starting point for any further
+    optimisation.
+
+  \subsection{Testing}
+    Tests live in \fn{tests/} with fixture images in \fn{tests/resources}. Patient
+    data is not committed, so \fn{tests/single\_image\_processing\_test.py}
+    carries a placeholder path that must be pointed at a local scan; run directly,
+    it also plots the extracted trace, which is the quickest way to sanity-check a
+    change to the segmentation code.
+
+  \subsection{Diagnostics and figure conventions}
+    Figures are addressed by number: figure 1 is the annotated scan and figure 2
+    the digitised waveforms. Traces are coloured consistently throughout —
+    morphological in blue (\fn{\#1f77b4}), ray tracing in red, and region growing
+    in violet (\fn{\#b026ff}) — and the same convention is used in this document.
+    Several functions accept a \fn{debug\_plots} argument that renders intermediate
+    masks; these are off by default because the batch path saves a fixed set of
+    figures instead.
+
+\newpage
+\section{Recommended Follow-Up}
+  The following items were identified while documenting the pipeline. They are
+  listed in rough order of how much they affect interpretation of the results.
+
+  \begin{enumerate}
+    \item \textbf{Reconcile the traffic-light thresholds with their docstrings}
+      (Section~\ref{sec:selection}). The implemented rules are stricter than
+      documented and they drive model selection, so the discrepancy matters
+      beyond presentation.
+    \item \textbf{Make the primary/overlay order consistent between entry points}
+      (Section~\ref{sec:asymmetry}), so that the \emph{Digitized Value (ray)}
+      column means the same thing regardless of how a DICOM file was processed.
+    \item \textbf{Quieten the two expected axis exceptions} so that a clean run
+      produces a clean log, while preserving tracebacks for unexpected failures.
+    \item \textbf{Replace \fn{morphology.binary\_erosion}} with
+      \fn{morphology.erosion} before scikit-image 0.28 removes it.
+    \item \textbf{Characterise and then enable the SQI filter}, or remove it, so
+      that its status is unambiguous.
+    \item \textbf{Restrict $TA_{\max}$ and $PI$ to complete beats}, since the
+      incomplete-beat shading already identifies the samples to exclude.
+    \item \textbf{Enforce the monotonicity result in \fn{validate\_axis\_ticks}},
+      which is currently computed and discarded.
+    \item \textbf{Unify the patient-identifier regular expressions} in
+      \fn{check\_file\_for\_us}, presently four digits for DICOM and three for
+      raster.
+    \item \textbf{Report a per-run summary} of processed, degraded and failed
+      scans, which the parallel-list structure already makes easy to compute.
+    \item \textbf{Remove dead code}: the \fn{exec("del ...")} loop in
+      \fn{segment}, the unused \fn{colour\_extract}, and the unread
+      \fn{patient\_paths} configuration key.
+  \end{enumerate}
+
+\end{document}
