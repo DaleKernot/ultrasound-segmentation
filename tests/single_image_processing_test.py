@@ -17,8 +17,7 @@ logger = logging.getLogger(__file__)
 
 def test_data_from_image():
     """Test the data_from_image function."""
-    img_path = "tests/resources/Rt_test_image.png" # Change this to the path of the image you want to test
-
+    img_path = "C:/Users/user/OneDrive/Desktop/STP/Master's/Year 3/data files/database_test/EYE_455_29+2_right_ophthalmic_repeat.jpg"
 
     #PIL_image = Image.open(img_path)
     #cv2_image = np.array(PIL_image)

@@ -1,6 +1,6 @@
 # Copy this file to `config.toml` and edit to match your local configuration.
-root_dir = "E:/us-data-anon" # Root directory to the stored data.
-output_dir = "E:/us-data-processed/"  # Where to save the processed data.
+root_dir = "C:/Users/user/OneDrive/Desktop/STP/Master's/Year 3/data files/database_test" # Root directory to the stored data.
+output_dir = "C:/Users/user/Documents/DEBUG/ultrasound-segmentation"  # Where to save the processed data.
 
 [pickle]
 likely_us_images = "likely_us_images.pkl"
