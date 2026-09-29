@@ -278,11 +278,11 @@ USE_SQI_FILTER = False
 # Keep saved Figure 2 clean by default (used in HTML output).
 SHOW_BEAT_DEBUG_SUBPLOTS = False
 # Region-grow: main-steps figure (+ optional detailed pipeline); not saved to batch.
-SHOW_GROW_DEBUG_PLOTS = True
+SHOW_GROW_DEBUG_PLOTS = False
 # Morphological method: refined-mask stages + Method-1 envelope overlay.
-SHOW_MORPH_DEBUG_PLOTS = True
+SHOW_MORPH_DEBUG_PLOTS = False
 # Ray tracing: Method-2 main-steps figure (k-means → yellow → picks → smooth).
-SHOW_RAY_DEBUG_PLOTS = True
+SHOW_RAY_DEBUG_PLOTS = False
 # Disk radius (pixels) for binary erosion of the refined mask before region-grow.
 # 0 disables. Shrinking the seed avoids over-thick refined blobs dominating seed
 # statistics and lets growth fill troughs; if erosion removes all seeds, the
@@ -530,7 +530,7 @@ def initial_segmentation(input_image_obj):
 
             # notice that the spread of values across R, G and B is reasonably small as the colours is a shade of white/grey,
             # It can be isolated by marking pixels with a low range (<50) and resonable brightness (sum or R G B components > 120)
-            if (rgb_range < 100 and max_rgb > 120):  # NEEDS REFINING - these values seem to be optimal for the majority tested.
+            if (rgb_range < 100 and max_rgb > 80):  # NEEDS REFINING - these values seem to be optimal for the majority tested.
                 pixel_data[x, y] = (
                     255,
                     255,
@@ -539,7 +539,7 @@ def initial_segmentation(input_image_obj):
                 pixel_data[x, y] = (0, 0, 0)  # If conditions not met, set to black/
 
             if img_RGB.size[1] > 600:
-                if y < 500:  # for some reason x==0 is white, this line negates this.
+                if y < 650:  # Confine wave search to the bottom portion of the image
                     pixel_data[x, y] = (0, 0, 0)
             else:
                 if y < 20:
@@ -2700,6 +2700,11 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
                 int(right_dimensions[2]): int(right_dimensions[3]),
                 int(right_dimensions[0]): int(right_dimensions[1]),
                 ]  # Left ROI
+        #plt.figure(figsize=(12, 8))
+        #plt.imshow(ROIAX, cmap="gray")
+        #plt.title("Right axis ROI after grayscale threshold")
+        #plt.axis("off")
+        #plt.show()
 
     ROI2 = np.zeros(np.shape(ROIAX))
     ROI3 = np.zeros(np.shape(ROIAX))
@@ -2774,6 +2779,15 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
         for Column in columns_to_remove:
             ROI2[:, Column] = 0
 
+        #plt.figure(figsize=(12, 8))
+        #plt.imshow(ROI2, cmap="gray")
+        #plt.title(
+        #    f"Right axis contour mask after column filter\n"
+        #    f"Removed {len(columns_to_remove)} / {roi_width} columns"
+        #)
+        #plt.axis("off")
+        #plt.show()
+
     ROI2 = ROI2.astype(np.uint8)
     contours, hierarchy = cv2.findContours(
         ROI2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
@@ -2834,6 +2848,26 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
     TGT = peaks[maxID]
     # TGT = all.index(max(all)) # The target is the X coord that most object lie on.
 
+    if side == "Right":
+        #plt.figure(figsize=(12, 4))
+        #plt.plot(all, color="black", linewidth=1.2, label="tick-object count")
+        if len(peaks) > 0:
+            plt.plot(peaks, np.asarray(all)[peaks], "rx", label="candidate peaks")
+            plt.axvline(
+                TGT,
+                color="limegreen",
+                linestyle="--",
+                linewidth=1.5,
+                label=f"selected TGT={TGT}",
+            )
+        #plt.title("Right axis column score profile")
+        #plt.xlabel("Column within right ROI")
+        #plt.ylabel("Tick-object count")
+        #plt.grid(True, alpha=0.3)
+        #plt.legend(loc="best")
+        #plt.tight_layout()
+        #plt.show()
+
     for id in ids:
         Ctest = np.reshape(Cs[id], (-1, 2))
         x_values = [i[0] for i in Ctest]
@@ -2873,6 +2907,21 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
             CenPoints.append(
                 [int((MAXX + MINX) / 2), int((MAXY + MINY) / 2)]
             )  # Calc center point as (0.5*(MaxX+MinX),0.5*(MaxY+MinY))
+
+    #if side == "Right":
+        #fig, ax = plt.subplots(figsize=(12, 8))
+        #ax.imshow(ROI2, cmap="gray")
+        #for contour in BCs:
+        #    pts = np.reshape(contour, (-1, 2))
+        #    ax.plot(pts[:, 0], pts[:, 1], color="cyan", linewidth=1.0)
+        #if len(CenPoints) > 0:
+        #    cen = np.asarray(CenPoints)
+        #    ax.scatter(cen[:, 0], cen[:, 1], c="yellow", s=24, label="tick centres")
+        #ax.axvline(TGT, color="red", linestyle="--", linewidth=1.5, label=f"TGT={TGT}")
+        #ax.set_title(f"Right axis filtered contours kept on target column\nSelected ticks: {len(BCs)}")
+        #ax.axis("off")
+        #ax.legend(loc="best")
+        #plt.show()
 
     def reject_outliers(data, m=8.0):
         d = np.abs(data - np.median(data))
@@ -4384,20 +4433,13 @@ def mean_wave(x_values, y_values, verbose=False):
     """
     Compute an average beat waveform from a contiguous Doppler waveform.
 
-    Method summary (aligned with current usseg beat logic):
-    1) Propose systolic anchor peaks with prominence-based peak finding and
-       merge peaks that are too close.
-    2) For each anchor peak, build a backward search window in the preceding
-       part of the beat.
-    3) In that window:
-       - smooth the signal,
-       - compute first derivative (slope) and second derivative (change in slope),
-       - find a second-derivative anchor (strongest upslope acceleration),
-       - walk backward on first derivative to the onset of low slope (foot onset).
-    4) Build beats foot-to-foot and derive PS/ED points within each beat for
-       diagnostics.
-    5) Segment foot-to-foot, align beats to a common x-axis, average, remove
-       outlier beats, and recompute the final mean wave.
+    Beat / foot detection matches the digitized HTML overlays
+    (``plot_correction`` → ``_beat_detection_pass_feet``):
+    1) Length-based peak/foot pass (``min_distance = len(x) // 15``).
+    2) If ``x`` looks HR-scaled in seconds (span > 1), refine with the
+       200 bpm time-based pass used by ``plot_correction``.
+    3) Segment foot-to-foot, align beats, average, drop outlier beats, and
+       return the mean ± SD curves.
 
     Parameters
     ----------
@@ -4421,225 +4463,66 @@ def mean_wave(x_values, y_values, verbose=False):
     """
     x_values = np.asarray(x_values, dtype=float)
     y_values = np.asarray(y_values, dtype=float)
-    wave_amplitude = y_values.max()-y_values.min()
+    if len(y_values) < 3 or len(x_values) != len(y_values):
+        raise ValueError("Not enough samples to calculate mean wave.")
 
-    peak_indices, _ = find_peaks(y_values, prominence=wave_amplitude / 4)
-    # Min separation (assume x is time): 200 bpm -> 0.3 s; merge peaks closer than that, keep highest
-    if len(peak_indices) > 1 and len(x_values) >= 2:
-        dx = float(np.median(np.diff(x_values)))
-        if np.isfinite(dx) and dx > 0:
-            min_distance = max(1, int(60.0 / 200.0 / dx))
-            order = np.argsort(peak_indices)
-            peaks = peak_indices[order]
-            consolidated = []
-            i = 0
-            while i < len(peaks):
-                j = i
-                best = int(peaks[i])
-                while j + 1 < len(peaks) and (int(peaks[j + 1]) - int(peaks[j])) <= min_distance:
-                    j += 1
-                    cand = int(peaks[j])
-                    if y_values[cand] > y_values[best]:
-                        best = cand
-                consolidated.append(best)
-                i = j + 1
-            peak_indices = np.array(consolidated, dtype=int)
-    # ------------------------------------------------------------------
-    # Foot finder aligned with current usseg logic:
-    # second-derivative anchor -> backward first-derivative onset threshold.
-    # ------------------------------------------------------------------
-    foot_indices = []
-    search_windows = []
-    debug_rows = []
+    # Same peak + foot detector as the digitized beat markers.
+    foot_indices = np.array([], dtype=int)
+    min_distance_pass1 = max(1, len(x_values) // 15)
+    feet1, peaks1, troughs1 = _beat_detection_pass_feet(
+        x_values, y_values, min_distance_pass1
+    )
+    if feet1.size >= 2 and peaks1.size > 0 and troughs1.size > 0:
+        foot_indices = feet1
 
-    search_fraction = 0.50
-    smooth_window_max = 11
-    polyorder = 2
-    min_samples_before_peak = 3
-    foot_max_rel_height = 0.55
-
-    for i in range(0, len(peak_indices)):
-        peak = int(peak_indices[i])
-        if i == 0:
-            if len(peak_indices) >= 3:
-                diffs = np.diff(peak_indices).astype(float)
-                other = diffs[1:] if len(diffs) >= 2 else diffs
-                interval_est = int(np.round(np.mean(other))) if other.size > 0 else 0
-            elif len(peak_indices) >= 2:
-                interval_est = int(peak_indices[1] - peak_indices[0])
-            else:
-                interval_est = 0
-            if interval_est < 5:
-                continue
-            interval = int(interval_est)
-            prev_peak = max(0, peak - interval)
-        else:
-            prev_peak = int(peak_indices[i - 1])
-            interval = int(peak - prev_peak)
-        if interval < 5:
-            continue
-
-        local_search_fraction = float(search_fraction) if i == 0 else max(0.0, float(search_fraction) - 0.10)
-        search_len = max(3, int(local_search_fraction * interval))
-        # If first-wave search would extend before signal start, skip this beat.
-        if i == 0 and (peak - search_len) < 0:
-            continue
-        search_start = max(prev_peak, peak - search_len)
-        search_end = max(search_start + 2, peak - int(max(1, min_samples_before_peak)))
-        if search_end <= search_start + 2:
-            continue
-
-        x_region_raw = np.asarray(x_values[search_start:search_end], dtype=float)
-        y_region = y_values[search_start:search_end]
-        if len(y_region) < 3 or x_region_raw.size != len(y_region):
-            continue
-
-        y_smooth = y_region.copy()
-        if len(y_region) >= 5:
-            win = min(smooth_window_max, len(y_region))
-            if win % 2 == 0:
-                win -= 1
-            if win >= 5:
-                y_smooth = savgol_filter(y_region, window_length=win, polyorder=polyorder)
-
-        try:
-            if np.all(np.isfinite(x_region_raw)) and (x_region_raw[-1] > x_region_raw[0]):
-                x_region = np.linspace(float(x_region_raw[0]), float(x_region_raw[-1]), int(len(x_region_raw)))
-                y_for_deriv = np.interp(x_region, x_region_raw, y_smooth)
-            else:
-                x_region = np.arange(search_end - search_start, dtype=float)
-                y_for_deriv = y_smooth
-        except Exception:
-            x_region = np.arange(search_end - search_start, dtype=float)
-            y_for_deriv = y_smooth
-
-        dy = np.gradient(y_for_deriv, x_region)
-        d2y_raw = np.gradient(dy, x_region)
-        d2y = d2y_raw.copy()
-        if len(y_region) >= 5:
-            win_d = min(smooth_window_max, len(y_region))
-            if win_d % 2 == 0:
-                win_d -= 1
-            if win_d >= 5:
-                d2y = savgol_filter(d2y_raw, window_length=win_d, polyorder=polyorder)
-
-        edge_guard = int(max(0, min(2, (len(d2y) - 1) // 2)))
-        if len(d2y) - (2 * edge_guard) >= 3:
-            d2_core = d2y[edge_guard: len(d2y) - edge_guard]
-            foot2_local = int(edge_guard + np.argmax(d2_core))
-        else:
-            foot2_local = int(np.argmax(d2y))
-
-        dy_seg = dy[: foot2_local + 1]
-        if dy_seg.size == 0:
-            continue
-        dy_max = float(np.max(dy_seg))
-        picked_local = int(foot2_local)
-        slope_thr = np.nan
-        if np.isfinite(dy_max) and dy_max > 0:
-            slope_thr = 0.08 * dy_max
-            for j in range(int(foot2_local), -1, -1):
-                if float(dy[j]) <= float(slope_thr):
-                    picked_local = int(j)
-                    break
-        picked = int(search_start + picked_local)
-
-        try:
-            trough_y = float(np.min(y_values[prev_peak:peak])) if peak > prev_peak + 1 else float(y_values[prev_peak])
-            peak_y = float(y_values[peak])
-        except Exception:
-            trough_y = float(np.min(y_region))
-            peak_y = float(np.max(y_region))
-        allowed_y = trough_y + float(foot_max_rel_height) * (peak_y - trough_y)
-        needs_fallback = (
-            picked < 0
-            or picked >= len(y_values)
-            or picked >= peak - int(max(1, min_samples_before_peak))
-            or float(y_values[picked]) > allowed_y
+    dx = float(np.median(np.diff(x_values))) if len(x_values) >= 2 else np.nan
+    span = float(x_values[-1] - x_values[0]) if len(x_values) else 0.0
+    # Second pass when x is already in seconds (HR-scaled), matching plot_correction.
+    if np.isfinite(dx) and dx > 0 and span > 1.0:
+        min_distance_pass2 = max(1, int((60.0 / 200.0) / dx))
+        feet2, peaks2, troughs2 = _beat_detection_pass_feet(
+            x_values, y_values, min_distance_pass2
         )
-        if needs_fallback:
-            seg_pre = y_values[search_start: search_start + foot2_local + 1]
-            if seg_pre.size > 0:
-                picked = int(search_start + int(np.argmin(seg_pre)))
-            else:
-                picked = int(search_start + foot2_local)
-
-        foot_indices.append(picked)
-        search_windows.append((search_start, search_end))
-        debug_rows.append(
-            {
-                "search_start": int(search_start),
-                "search_end": int(search_end),
-                "foot2_global": int(search_start + foot2_local),
-                "picked_global": int(picked),
-                "dy": np.asarray(dy, dtype=float),
-                "d2y": np.asarray(d2y, dtype=float),
-                "slope_thr": float(slope_thr) if np.isfinite(slope_thr) else np.nan,
-            }
-        )
+        if feet2.size >= 2 and peaks2.size > 0 and troughs2.size > 0:
+            foot_indices = feet2
 
     foot_indices = np.asarray(foot_indices, dtype=int)
     if len(foot_indices) < 2:
         raise ValueError("Not enough foot points found to calculate mean wave.")
-    # PS/ED from foot-defined beats (same policy as usseg).
-    y_s = np.asarray(y_values, dtype=float)
-    if len(y_values) >= 5:
-        y_s = np.convolve(y_values, np.ones(5) / 5.0, mode="same")
-    ps_indices = []
-    ed_indices = []
-    for i in range(len(foot_indices) - 1):
-        a = int(foot_indices[i])
-        b = int(foot_indices[i + 1])
-        if b <= a + 2:
-            continue
-        seg = y_s[a:b]
-        anchor_in_beat = peak_indices[(peak_indices >= a) & (peak_indices < b)]
-        ps_idx = None
-        if anchor_in_beat.size > 0:
-            aa = anchor_in_beat[np.argmax(y_s[anchor_in_beat])]
-            ps_idx = int(aa)
-            ps_indices.append(ps_idx)
-        else:
-            ps_idx = int(a + int(np.argmax(seg)))
-            ps_indices.append(ps_idx)
-
-        # ED is constrained to occur after PS within the same beat.
-        ed_start = int(max(a, ps_idx + 1))
-        if ed_start < b:
-            seg_ed = y_s[ed_start:b]
-            if seg_ed.size > 0:
-                ed_indices.append(int(ed_start + int(np.argmin(seg_ed))))
-                continue
-        # Fallback for very short post-PS segments.
-        ed_indices.append(int(a + int(np.argmin(seg))))
     segment_indices = foot_indices
 
-
     interpolated_waves = []
+    x0_ref = None
     if verbose:
         logger.warning("mean_wave(verbose=True): use scratch/mean_wave_test.py for diagnostic plots")
 
     for i in range(len(segment_indices) - 1):
         # Extract data for the current segment
-        start_index = segment_indices[i]
-        end_index = segment_indices[i + 1]
+        start_index = int(segment_indices[i])
+        end_index = int(segment_indices[i + 1])
+        if end_index <= start_index + 2:
+            continue
         x_segment = x_values[start_index:end_index]
         y_segment = y_values[start_index:end_index]
+        if len(x_segment) < 2 or len(x_segment) != len(y_segment):
+            continue
 
-        # Shift x-coordinates for alignment (except the first wave)
-        if i > 0:
-            x_segment = x_segment - (x_segment[0] - x_values[segment_indices[0]])
-
-        # Initialize the common x-axis using the first segment
-        if i == 0:
+        # Shift x-coordinates for alignment (except the first retained wave)
+        if x0_ref is None:
+            x0_ref = float(x_segment[0])
             x_min = x_segment[0]
             x_max = x_segment[-1]
             x_common_points = len(x_segment)
             x_common = np.linspace(x_min, x_max, x_common_points)
+        else:
+            x_segment = x_segment - (x_segment[0] - x0_ref)
 
         # Interpolate to the common x-axis
         interp_y = interp1d(x_segment, y_segment, kind='linear', fill_value="extrapolate")(x_common)
         interpolated_waves.append(interp_y)
+
+    if not interpolated_waves:
+        raise ValueError("No usable foot-to-foot segments for mean wave.")
 
     # Convert the list of interpolated waves to a NumPy array for calculations
     interpolated_waves_np = np.vstack(interpolated_waves)
@@ -4740,8 +4623,8 @@ def save_mean_waves_ray_morph_grow_figure(
             continue
         try:
             y_avg, x_c, y_std = mean_wave(xa, ya, verbose=False)
-        except Exception:
-            logger.info("mean_wave failed for %s (need >=2 feet)", label)
+        except Exception as exc:
+            logger.info("mean_wave failed for %s: %s", label, exc)
             continue
         if x_c is None or y_avg is None or len(x_c) < 2 or len(y_avg) != len(x_c):
             continue
@@ -4769,7 +4652,7 @@ def save_mean_waves_ray_morph_grow_figure(
         ax.text(
             0.5,
             0.5,
-            "No mean wave (need >=2 feet per trace)",
+            "No mean wave (beat/foot detection failed)",
             ha="center",
             va="center",
             transform=ax.transAxes,
