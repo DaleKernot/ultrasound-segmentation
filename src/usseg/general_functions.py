@@ -2777,7 +2777,7 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
             
             # Remove column if too many tick objects overlap (likely axis-dominated area)
             # or if no tick objects touch it (pure axis/noise)
-            if tick_count > 20 or tick_count == 0:
+            if tick_count > 25 or tick_count == 0:
                 columns_to_remove.append(Column)
         
         # Remove identified columns from ROI2
@@ -2849,7 +2849,7 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
         maxID = np.argmax(peaks)
     elif side == "Right":
         peak_wid = signal.peak_widths(all, peaks)
-        maxID = np.argmax(vals["peak_heights"] * peak_wid[0])
+        maxID = np.argmax(vals["peak_heights"])
 
     TGT = peaks[maxID]
     # TGT = all.index(max(all)) # The target is the X coord that most object lie on.

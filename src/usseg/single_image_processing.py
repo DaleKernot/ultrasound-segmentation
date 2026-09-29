@@ -36,6 +36,7 @@ from usseg.general_functions import (
     SHOW_GROW_DEBUG_PLOTS,
     SHOW_MORPH_DEBUG_PLOTS,
     SHOW_RAY_DEBUG_PLOTS,
+    SHOW_TICK_LABEL_DEBUG_PLOTS,
 )
 
 logger = logging.getLogger(__file__)
@@ -48,6 +49,7 @@ def _maybe_close_figures():
         or SHOW_BEAT_DEBUG_SUBPLOTS
         or SHOW_MORPH_DEBUG_PLOTS
         or SHOW_RAY_DEBUG_PLOTS
+        or SHOW_TICK_LABEL_DEBUG_PLOTS
     ):
         return
     plt.close("all")
