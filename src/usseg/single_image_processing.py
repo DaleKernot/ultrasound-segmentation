@@ -43,16 +43,37 @@ logger = logging.getLogger(__file__)
 
 
 def _maybe_close_figures():
-    """Close matplotlib figures unless debug plotting is enabled."""
-    if (
-        SHOW_GROW_DEBUG_PLOTS
-        or SHOW_BEAT_DEBUG_SUBPLOTS
-        or SHOW_MORPH_DEBUG_PLOTS
-        or SHOW_RAY_DEBUG_PLOTS
-        or SHOW_TICK_LABEL_DEBUG_PLOTS
-    ):
+    """Close matplotlib figures not belonging to an active SHOW_* debug flag.
+
+    Method-specific debug plotters tag their figures with ``fig._usseg_debug``
+    (``ray`` / ``grow`` / ``morph`` / ``tick``). When a flag is on, only those
+    tagged figures are kept — so ``SHOW_RAY_DEBUG_PLOTS`` does not leave morph
+    overlays, curve-comparison panels, or plot_correction Figure 2 open.
+    """
+    allowed = set()
+    if SHOW_RAY_DEBUG_PLOTS:
+        allowed.add("ray")
+    if SHOW_GROW_DEBUG_PLOTS:
+        allowed.add("grow")
+    if SHOW_MORPH_DEBUG_PLOTS:
+        allowed.add("morph")
+    if SHOW_TICK_LABEL_DEBUG_PLOTS:
+        allowed.add("tick")
+    if SHOW_BEAT_DEBUG_SUBPLOTS:
+        allowed.add("beat")
+
+    if not allowed:
+        plt.close("all")
         return
-    plt.close("all")
+
+    for num in list(plt.get_fignums()):
+        fig = plt.figure(num)
+        tag = getattr(fig, "_usseg_debug", None)
+        # plot_correction uses numbered Figure 2 for beat / digitized overlays.
+        if tag is None and num == 2 and "beat" in allowed:
+            tag = "beat"
+        if tag not in allowed:
+            plt.close(fig)
 
 
 def data_from_image(pil_img=None, cv2_img=None, image_path=None):

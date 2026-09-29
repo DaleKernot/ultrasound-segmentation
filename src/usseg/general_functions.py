@@ -280,8 +280,9 @@ SHOW_BEAT_DEBUG_SUBPLOTS = False
 # Region-grow: main-steps figure (+ optional detailed pipeline); not saved to batch.
 SHOW_GROW_DEBUG_PLOTS = False
 # Morphological method: refined-mask stages + Method-1 envelope overlay.
-SHOW_MORPH_DEBUG_PLOTS = False
-# Ray tracing: Method-2 main-steps figure (k-means → yellow → picks → smooth).
+SHOW_MORPH_DEBUG_PLOTS = True
+# Ray tracing: Method-2 main-steps figure only (k-means → yellow → picks → smooth).
+# Does not enable morph/grow/curve-comparison figures.
 SHOW_RAY_DEBUG_PLOTS = False
 # Axis tick / label search: ROI, tick-object filter, column score, retained ticks, OCR boxes.
 SHOW_TICK_LABEL_DEBUG_PLOTS = False
@@ -1373,6 +1374,11 @@ def _plot_morph_refine_debug(input_image_bgr, stages, Xmin, Xmax, Ymin, Ymax, ro
         y=0.995,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig._usseg_debug = "morph"
+    try:
+        fig.canvas.manager.set_window_title("Morph refine debug")
+    except Exception:
+        pass
 
 
 def _plot_morph_envelope_debug(
@@ -1485,14 +1491,24 @@ def _plot_morph_envelope_debug(
         y=1.02,
     )
     fig.tight_layout()
+    fig._usseg_debug = "morph"
+    try:
+        fig.canvas.manager.set_window_title("Morph Method-1 envelope")
+    except Exception:
+        pass
 
 
 def _plot_ray_main_steps_debug(
     roi_bgr,
     roi_gray,
+    cluster_labels,
+    bg_cluster,
+    cluster_means,
     signal_pre_yellow,
     yellow_mask,
     signal_mask,
+    run3_hit_mask,
+    pick_mode,
     picked_y_raw,
     picked_y_smooth,
     full_rgb,
@@ -1505,71 +1521,177 @@ def _plot_ray_main_steps_debug(
     max_col_step_y,
 ):
     """
-    Method 2 (pipeline_overview): k-means signal → yellow removal → column
-    picks with continuity → gap-fill / Hampel / medfilt → full-image mask.
+    Method 2 (pipeline_overview): k-means clusters → yellow removal → column
+    picks (banded / fallback) → gap-fill / Hampel / medfilt → full-image mask.
+
+    ``pick_mode`` per column: 0=first/seed, 1=banded, 2=full-col fallback,
+    3=fallback clipped to step, -1=no pick.
     """
     roi_rgb = cv2.cvtColor(np.asarray(roi_bgr), cv2.COLOR_BGR2RGB)
     rows, cols = roi_gray.shape
     xs = np.arange(cols, dtype=float)
+    raw = np.asarray(picked_y_raw, dtype=float)
+    sm = np.asarray(picked_y_smooth, dtype=float)
+    labels = np.asarray(cluster_labels)
+    sig_pre = np.asarray(signal_pre_yellow, dtype=bool)
+    yel = np.asarray(yellow_mask, dtype=bool)
+    sig = np.asarray(signal_mask, dtype=bool)
+    run3 = np.asarray(run3_hit_mask) > 0
+    modes = np.asarray(pick_mode, dtype=int)
 
-    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+    fig, axes = plt.subplots(3, 3, figsize=(16, 13))
 
+    # 1. ROI
     axes[0, 0].imshow(roi_rgb)
     axes[0, 0].set_title("1. Ray ROI (inset applied)", fontsize=9)
     axes[0, 0].axis("off")
 
-    axes[0, 1].imshow(roi_rgb)
-    sig0 = np.ma.masked_where(~np.asarray(signal_pre_yellow), np.ones_like(roi_gray))
-    axes[0, 1].imshow(sig0, cmap="Greens", alpha=0.45, vmin=0, vmax=1)
-    axes[0, 1].set_title("2. k-means signal (k=3, ¬background)", fontsize=9)
-    axes[0, 1].axis("off")
-
-    axes[0, 2].imshow(roi_rgb)
-    yel = np.ma.masked_where(~np.asarray(yellow_mask), np.ones_like(roi_gray))
-    sig1 = np.ma.masked_where(~np.asarray(signal_mask), np.ones_like(roi_gray))
-    axes[0, 2].imshow(yel, cmap="autumn", alpha=0.55, vmin=0, vmax=1)
-    axes[0, 2].imshow(sig1, cmap="Greens", alpha=0.40, vmin=0, vmax=1)
-    axes[0, 2].set_title("3. Yellow removed → final signal", fontsize=9)
-    axes[0, 2].axis("off")
-
-    axes[1, 0].imshow(roi_gray, cmap="gray")
-    raw = np.asarray(picked_y_raw, dtype=float)
-    ok = np.isfinite(raw)
-    if np.any(ok):
-        axes[1, 0].plot(xs[ok], raw[ok], color=RAY_CURVE_COLOR, linewidth=1.2)
-    axes[1, 0].set_title(
-        f"4. Column picks (keep={keep}, step≤{int(max_col_step_y)})",
+    # 2. Cluster id map (bg marked)
+    cluster_vis = labels.astype(float).copy()
+    axes[0, 1].imshow(cluster_vis, cmap="tab10", vmin=0, vmax=9, interpolation="nearest")
+    means_txt = ", ".join(
+        f"c{i}={v:.0f}" if np.isfinite(v) else f"c{i}=—"
+        for i, v in enumerate(cluster_means)
+    )
+    axes[0, 1].set_title(
+        f"2. k-means clusters (bg={bg_cluster})\n{means_txt}",
         fontsize=9,
     )
-    axes[1, 0].set_xlim([0, cols - 1])
-    axes[1, 0].set_ylim([rows - 1, 0])
+    axes[0, 1].axis("off")
 
+    # 3. Before/after bg gate (green kept / red removed)
+    axes[0, 2].imshow(roi_rgb)
+    kept = np.zeros((*roi_rgb.shape[:2], 4), dtype=float)
+    gone = np.zeros((*roi_rgb.shape[:2], 4), dtype=float)
+    kept[sig_pre] = mcolors.to_rgba("limegreen", alpha=0.40)
+    gone[~sig_pre] = mcolors.to_rgba("red", alpha=0.35)
+    axes[0, 2].imshow(kept)
+    axes[0, 2].imshow(gone)
+    axes[0, 2].set_title(
+        "3. After bg gate\n(green=signal, red=background)",
+        fontsize=9,
+    )
+    axes[0, 2].axis("off")
+
+    # 4. Yellow removed → final signal
+    axes[1, 0].imshow(roi_rgb)
+    yel_tint = np.zeros((*roi_rgb.shape[:2], 4), dtype=float)
+    sig_tint = np.zeros((*roi_rgb.shape[:2], 4), dtype=float)
+    yel_tint[yel] = mcolors.to_rgba("orange", alpha=0.55)
+    sig_tint[sig] = mcolors.to_rgba("limegreen", alpha=0.35)
+    axes[1, 0].imshow(yel_tint)
+    axes[1, 0].imshow(sig_tint)
+    axes[1, 0].set_title(
+        f"4. Yellow stripped → final signal\n(yellow px={int(np.sum(yel))})",
+        fontsize=9,
+    )
+    axes[1, 0].axis("off")
+
+    # 5. Run-of-3 hit loci (where consecutive signal runs were found)
     axes[1, 1].imshow(roi_gray, cmap="gray")
-    sm = np.asarray(picked_y_smooth, dtype=float)
-    ok_s = np.isfinite(sm)
-    if np.any(ok_s):
-        axes[1, 1].plot(xs[ok_s], sm[ok_s], color=RAY_CURVE_COLOR, linewidth=1.6)
-    axes[1, 1].set_title("5. After interp + Hampel + medfilt(3)", fontsize=9)
-    axes[1, 1].set_xlim([0, cols - 1])
-    axes[1, 1].set_ylim([rows - 1, 0])
+    if np.any(run3):
+        r3 = np.zeros((*roi_gray.shape, 4), dtype=float)
+        r3[run3] = mcolors.to_rgba("cyan", alpha=0.70)
+        axes[1, 1].imshow(r3)
+    axes[1, 1].set_title("5. Run-of-3 hit pixels\n(cyan; else brightest fallback)", fontsize=9)
+    axes[1, 1].axis("off")
 
-    axes[1, 2].imshow(full_rgb)
+    # 6. Column picks coloured by continuity mode
+    axes[1, 2].imshow(roi_gray, cmap="gray")
+    mode_colors = {
+        0: ("deepskyblue", "first/seed"),
+        1: ("lime", "banded"),
+        2: ("orange", "full fallback"),
+        3: ("red", "clipped fallback"),
+    }
+    n_mode_first = int(np.sum(modes == 0))
+    n_mode_banded = int(np.sum(modes == 1))
+    n_mode_fb = int(np.sum(modes == 2))
+    n_mode_clip = int(np.sum(modes == 3))
+    for m_id, (color, _lab) in mode_colors.items():
+        sel = (modes == m_id) & np.isfinite(raw)
+        if np.any(sel):
+            axes[1, 2].scatter(
+                xs[sel],
+                raw[sel],
+                s=8,
+                c=color,
+                label=_lab,
+                zorder=3,
+            )
+    axes[1, 2].set_title(
+        f"6. Picks by mode (keep={keep}, step≤{int(max_col_step_y)})\n"
+        f"banded={n_mode_banded}; fallback={n_mode_fb}; "
+        f"clipped={n_mode_clip}; seed={n_mode_first}",
+        fontsize=9,
+    )
+    axes[1, 2].set_xlim([0, cols - 1])
+    axes[1, 2].set_ylim([rows - 1, 0])
+    axes[1, 2].legend(loc="upper right", fontsize=7, markerscale=1.5, framealpha=0.7)
+
+    # 7. Raw vs smooth overlay
+    axes[2, 0].imshow(roi_gray, cmap="gray")
+    ok = np.isfinite(raw)
+    ok_s = np.isfinite(sm)
+    if np.any(ok):
+        axes[2, 0].plot(xs[ok], raw[ok], color="deepskyblue", linewidth=1.0, label="raw", alpha=0.9)
+    if np.any(ok_s):
+        axes[2, 0].plot(xs[ok_s], sm[ok_s], color=RAY_CURVE_COLOR, linewidth=1.6, label="smooth")
+    axes[2, 0].set_title("7. Raw picks vs smoothed curve", fontsize=9)
+    axes[2, 0].set_xlim([0, cols - 1])
+    axes[2, 0].set_ylim([rows - 1, 0])
+    axes[2, 0].legend(loc="upper right", fontsize=7, framealpha=0.7)
+
+    # 8. Column-to-column Δy (continuity / jump diagnostic)
+    if np.any(ok):
+        dy = np.full(cols, np.nan, dtype=float)
+        valid_idx = np.where(ok)[0]
+        if valid_idx.size >= 2:
+            for i in range(1, valid_idx.size):
+                a, b = int(valid_idx[i - 1]), int(valid_idx[i])
+                if b == a + 1:
+                    dy[b] = raw[b] - raw[a]
+        jump = np.isfinite(dy) & (np.abs(dy) > float(max_col_step_y))
+        ok_dy = np.isfinite(dy)
+        if np.any(ok_dy):
+            axes[2, 1].plot(xs[ok_dy], dy[ok_dy], color="steelblue", linewidth=1.0)
+        if np.any(jump):
+            axes[2, 1].scatter(
+                xs[jump], dy[jump], s=18, c="red", zorder=3, label="|Δy|>step"
+            )
+            axes[2, 1].legend(loc="upper right", fontsize=7, framealpha=0.7)
+        axes[2, 1].axhline(
+            max_col_step_y, color="orange", linestyle="--", linewidth=0.8
+        )
+        axes[2, 1].axhline(
+            -max_col_step_y, color="orange", linestyle="--", linewidth=0.8
+        )
+        axes[2, 1].axhline(0.0, color="gray", linestyle=":", linewidth=0.6)
+    axes[2, 1].set_title(
+        f"8. Adjacent-column Δy (raw)\norange = ±step ({int(max_col_step_y)})",
+        fontsize=9,
+    )
+    axes[2, 1].set_xlim([0, cols - 1])
+    axes[2, 1].set_ylabel("Δy (px)", fontsize=8)
+    axes[2, 1].grid(True, alpha=0.25)
+
+    # 9. Final mask on full image
+    axes[2, 2].imshow(full_rgb)
     if trace_mask_full is not None:
         tm = np.asarray(trace_mask_full) > 0
         if np.any(tm):
             tint = np.zeros((*full_rgb.shape[:2], 4), dtype=float)
             tint[tm] = mcolors.to_rgba(RAY_CURVE_COLOR, alpha=0.85)
-            axes[1, 2].imshow(tint)
-    # Draw ROI box
-    axes[1, 2].plot(
+            axes[2, 2].imshow(tint)
+    axes[2, 2].plot(
         [x1, x2, x2, x1, x1],
         [y1, y1, y2, y2, y1],
         color="yellow",
         linewidth=1.0,
         linestyle="--",
     )
-    axes[1, 2].set_title("6. Final ray mask on full image", fontsize=9)
-    axes[1, 2].axis("off")
+    axes[2, 2].set_title("9. Final ray mask on full image", fontsize=9)
+    axes[2, 2].axis("off")
 
     fig.suptitle(
         f"Ray — Method 2 main steps (ROI y={y1}:{y2}, x={x1}:{x2})",
@@ -1577,6 +1699,11 @@ def _plot_ray_main_steps_debug(
         y=0.995,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig._usseg_debug = "ray"
+    try:
+        fig.canvas.manager.set_window_title("Ray Method-2 debug")
+    except Exception:
+        pass
 
 
 def _plot_grow_main_steps_debug(
@@ -1747,6 +1874,11 @@ def _plot_grow_main_steps_debug(
         y=0.995,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig._usseg_debug = "grow"
+    try:
+        fig.canvas.manager.set_window_title("Grow Method-3 debug")
+    except Exception:
+        pass
 
 
 def _morphological_top_curve_from_mask(
@@ -1794,7 +1926,7 @@ def _morphological_top_curve_from_mask(
                 top_curve_mask[r, :] = 0
             keep = "lower"
     else:
-        for r in range(int(rp[0].centroid[0]), top_curve_mask.shape[0]):
+        for r in range(int(rp[0].centroid[0])+10, top_curve_mask.shape[0]):
             top_curve_mask[r, :] = 0
         if check_inverted_curve(top_curve_mask, Ymax, Ymin):
             top_curve_mask = mask - ws
@@ -1918,7 +2050,7 @@ def segment_refinement(
             x0, x1 = int(xs.min()), int(xs.max()) + 1
             roi_bgr = input_image_obj[y0:y1, x0:x1]
             roi_gray = gray[y0:y1, x0:x1]
-            signal_roi, bg_cluster, cluster_means, cluster_counts = (
+            signal_roi, bg_cluster, cluster_means, cluster_counts, _labels = (
                 colour_kmeans_signal_mask_roi(roi_bgr, roi_gray)
             )
             kmeans_signal_full = np.zeros_like(allowed, dtype=bool)
@@ -1985,7 +2117,7 @@ def segment_refinement(
         input_image_obj=input_image_obj,
         Xmin=Xmin,
         Xmax=Xmax,
-        plot_curve_comparison=True,
+        plot_curve_comparison=False,
         ray_max_col_step_y=ray_max_col_step_y,
         morph_debug_plots=morph_debug_plots,
         grown_binary_mask=(
@@ -2330,8 +2462,10 @@ def colour_kmeans_signal_mask_roi(roi_bgr: np.ndarray, roi_gray: np.ndarray):
     k-means (k=3) colour prefilter shared by ray tracing and region-grow.
 
     Clusters ROI pixels in BGR; the cluster with the darkest mean gray is
-    background. Returns ``(signal_mask, bg_cluster, cluster_means, cluster_counts)``
-    where ``signal_mask`` is True for non-background clusters (same shape as ROI).
+    background. Returns
+    ``(signal_mask, bg_cluster, cluster_means, cluster_counts, labels)``
+    where ``signal_mask`` is True for non-background clusters and ``labels``
+    is the per-pixel cluster id map (same shape as ROI).
     """
     if roi_bgr.ndim != 3 or roi_bgr.shape[2] != 3:
         raise ValueError("roi_bgr must be HxWx3 BGR")
@@ -2339,7 +2473,7 @@ def colour_kmeans_signal_mask_roi(roi_bgr: np.ndarray, roi_gray: np.ndarray):
         raise ValueError("roi_gray must match roi_bgr spatial shape")
     if roi_gray.size == 0:
         empty = np.zeros(roi_gray.shape, dtype=bool)
-        return empty, -1, [], []
+        return empty, -1, [], [], np.zeros(roi_gray.shape, dtype=np.int32)
 
     px = roi_bgr.reshape((-1, 3)).astype(np.float32)
     k = 3
@@ -2356,7 +2490,7 @@ def colour_kmeans_signal_mask_roi(roi_bgr: np.ndarray, roi_gray: np.ndarray):
         cluster_counts.append(int(np.sum(m)))
     bg_cluster = int(np.argmin(cluster_means))
     signal_mask = labels != bg_cluster
-    return signal_mask, bg_cluster, cluster_means, cluster_counts
+    return signal_mask, bg_cluster, cluster_means, cluster_counts, labels
 
 
 def ray_trace_waveform_segmentation(
@@ -2405,7 +2539,7 @@ def ray_trace_waveform_segmentation(
     # 1) Cluster all ROI pixels in colour space.
     # 2) Estimate which cluster is background by luminance (darkest mean gray).
     # 3) Keep everything else as "signal candidates".
-    signal_pre_yellow, bg_cluster, cluster_means, cluster_counts = (
+    signal_pre_yellow, bg_cluster, cluster_means, cluster_counts, cluster_labels = (
         colour_kmeans_signal_mask_roi(roi_bgr, roi_gray)
     )
     signal_mask = signal_pre_yellow.copy()
@@ -2426,7 +2560,7 @@ def ray_trace_waveform_segmentation(
         int(np.sum(signal_mask)),
     )
 
-    show_debug = bool(debug_plots or SHOW_RAY_DEBUG_PLOTS)
+    show_ray_debug = bool(debug_plots or SHOW_RAY_DEBUG_PLOTS)
 
     rows, cols = roi_gray.shape
     max_col_step_y = int(max(3, int(max_col_step_y)))
@@ -2434,6 +2568,8 @@ def ray_trace_waveform_segmentation(
     trace_mask_roi = np.zeros((rows, cols), dtype=np.uint8)
     picked_y_per_col = np.full(cols, np.nan, dtype=float)
     run3_hit_mask = np.zeros((rows, cols), dtype=np.uint8)
+    # Per-column pick mode: -1 none, 0 first/seed, 1 banded, 2 full fallback, 3 clipped
+    pick_mode = np.full(cols, -1, dtype=np.int8)
 
     # Logging counters (to avoid per-column spam)
     n_banded_attempts = 0
@@ -2447,6 +2583,7 @@ def ray_trace_waveform_segmentation(
         col_gray = roi_gray[:, x]
 
         y_pick = None
+        mode = -1
         if prev_y is not None:
             n_banded_attempts += 1
             lo = max(0, int(round(prev_y)) - max_col_step_y)
@@ -2462,6 +2599,8 @@ def ray_trace_waveform_segmentation(
                 x,
                 y_low,
             )
+            if y_pick is not None:
+                mode = 1  # banded
 
         if y_pick is None:
             y_pick = _pick_y_from_column_signal(
@@ -2475,26 +2614,24 @@ def ray_trace_waveform_segmentation(
             if y_pick is not None and prev_y is not None:
                 # Banded pick failed; full-column fallback succeeded.
                 n_fallback_full_col += 1
+                y_unclipped = int(y_pick)
                 y_pick = int(
                     np.clip(y_pick, prev_y - max_col_step_y, prev_y + max_col_step_y)
                 )
-                # If clipping changed the pick, note that too.
-                if abs(float(y_pick) - float(prev_y)) > float(max_col_step_y) + 1e-6:
-                    # Defensive: should never happen due to clip, but keep counter meaningful.
+                if y_pick != y_unclipped:
                     n_fallback_clipped += 1
-                # More relevant: detect whether clip actually moved the fallback.
-                # (Compare unclipped vs clipped without storing extra state.)
-                # We approximate by checking whether the fallback was near bounds.
-                if y_pick == int(round(prev_y - max_col_step_y)) or y_pick == int(
-                    round(prev_y + max_col_step_y)
-                ):
-                    n_fallback_clipped += 1
+                    mode = 3  # clipped fallback
+                else:
+                    mode = 2  # full-column fallback within step
+            elif y_pick is not None:
+                mode = 0  # first / seed column
 
         if y_pick is None:
             continue
 
         trace_mask_roi[y_pick, x] = 1
         picked_y_per_col[x] = float(y_pick)
+        pick_mode[x] = mode
         prev_y = float(y_pick)
 
     # One concise log line when we had to fall back.
@@ -2534,15 +2671,20 @@ def ray_trace_waveform_segmentation(
     trace_mask = np.zeros((h, w), dtype=bool)
     trace_mask[y1:y2, x1:x2] = trace_mask_roi
 
-    if show_debug:
+    if show_ray_debug:
         try:
             full_rgb = cv2.cvtColor(np.asarray(image), cv2.COLOR_BGR2RGB)
             _plot_ray_main_steps_debug(
                 roi_bgr,
                 roi_gray,
+                cluster_labels,
+                bg_cluster,
+                cluster_means,
                 signal_pre_yellow,
                 yellow_mask,
                 signal_mask,
+                run3_hit_mask,
+                pick_mode,
                 picked_y_raw,
                 picked_y_smooth,
                 full_rgb,
@@ -2568,7 +2710,7 @@ def compute_top_curve(
     input_image_obj=None,
     Xmin=None,
     Xmax=None,
-    plot_curve_comparison=True,
+    plot_curve_comparison=False,
     ray_max_col_step_y=None,
     grown_binary_mask=None,
     morph_debug_plots=False,
@@ -2591,6 +2733,8 @@ def compute_top_curve(
 
     If ``plot_curve_comparison`` is True, builds two figures: both coordinate
     traces on one image, and a two-panel view of the morph vs ray masks.
+    Off by default so method-specific ``SHOW_*_DEBUG_PLOTS`` flags only surface
+    their own figures.
 
     If ``morph_debug_plots`` or ``SHOW_MORPH_DEBUG_PLOTS`` is True, Method-1
     envelope debug figures are built when ``input_image_obj`` is available
@@ -2819,6 +2963,7 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
 
     if SHOW_TICK_LABEL_DEBUG_PLOTS:
         plt.figure(figsize=(12, 8))
+        plt.gcf()._usseg_debug = "tick"
         plt.imshow(ROIAX, cmap="gray")
         plt.title(f"{side} axis ROI after grayscale threshold")
         plt.axis("off")
@@ -2870,6 +3015,7 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
             vis_image[tick_mask] = [255, 0, 0]  # Red for tick objects
             
             plt.figure(figsize=(12, 8))
+            plt.gcf()._usseg_debug = "tick"
             plt.imshow(vis_image)
             plt.title(
                 f"Right axis ROI: Tick objects (red) vs all objects (gray)\n"
@@ -2900,6 +3046,7 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
 
         if SHOW_TICK_LABEL_DEBUG_PLOTS:
             plt.figure(figsize=(12, 8))
+            plt.gcf()._usseg_debug = "tick"
             plt.imshow(ROI2, cmap="gray")
             plt.title(
                 f"Right axis contour mask after column filter\n"
@@ -2970,6 +3117,7 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
 
     if SHOW_TICK_LABEL_DEBUG_PLOTS:
         plt.figure(figsize=(12, 4))
+        plt.gcf()._usseg_debug = "tick"
         plt.plot(all, color="black", linewidth=1.2, label="tick-object count")
         if len(peaks) > 0:
             plt.plot(peaks, np.asarray(all)[peaks], "rx", label="candidate peaks")
@@ -3030,6 +3178,7 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
 
     if SHOW_TICK_LABEL_DEBUG_PLOTS:
         fig, ax = plt.subplots(figsize=(12, 8))
+        fig._usseg_debug = "tick"
         ax.imshow(ROI2, cmap="gray")
         for contour in BCs:
             pts = np.reshape(contour, (-1, 2))
@@ -3411,6 +3560,7 @@ def search_for_labels(
 
     if SHOW_TICK_LABEL_DEBUG_PLOTS:
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig._usseg_debug = "tick"
         axes[0].imshow(ROIAX, cmap="gray")
         axes[0].set_title(f"{Side} label OCR ROI")
         axes[0].axis("off")
