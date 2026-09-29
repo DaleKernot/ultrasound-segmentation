@@ -3,6 +3,8 @@
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath, amssymb}
 \usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
 \usepackage{hyperref}
 \usepackage{listings}
 \usepackage{siunitx}
@@ -10,6 +12,8 @@
 \usepackage{longtable}
 \usepackage{xcolor}
 \usepackage{framed}
+\usepackage{float}
+\usepackage[skip=1em]{parskip}
 
 \lstset{
   basicstyle=\ttfamily\small,
@@ -36,59 +40,77 @@
 
 \newpage
 \section{Introduction}
-  \subsection{Motivation and clinical context}
-    Doppler ultrasound scans contain two linked sources of information. The
-    first is the image of the Doppler waveform, which can be segmented and
-    digitised into a velocity-time trace. The second is the machine-generated
-    text panel, which commonly reports clinical measurements such as peak
-    systolic velocity, end diastolic velocity, heart rate, pulsatility index,
-    and resistive index.\\
-    \\
-    The aim of this pipeline is to extract both sources of information from a
-    scan, compare them where possible, and return a structured table of
-    measurements together with a digitised waveform trace. The code is designed
-    around scans with a clearly visible Doppler waveform and machine annotation,
-    but the implementation contains fallback behaviour for incomplete axes,
-    missing labels, and scans where only part of the expected visual structure is
-    present.\\
-    \\
-    Two fundamentally different classes of input are supported, and they are
-    calibrated in fundamentally different ways. Screenshot-style raster images
-    (JPEG, PNG and similar) carry no calibration metadata, so the pipeline must
-    recover the velocity scale by reading the axis tick marks and numeric labels
-    off the image itself. DICOM files carry explicit spatial calibration in their
-    metadata, so the pixel-to-physical-unit mapping is read directly rather than
-    inferred. Keeping these two paths clearly separated is essential to
-    understanding the codebase, and this document treats them as distinct
-    branches throughout.
+  A Doppler scan carries two things worth extracting: the waveform, which can
+  be digitised into a velocity-time trace, and the machine-printed metric panel
+  (peak systolic and end-diastolic velocity, heart rate, pulsatility index,
+  resistive index, and so on). The pipeline returns both, as a table and a
+  trace. On raster screenshots the printed values are also the reference used
+  to choose among three segmentation methods.
 
-  \subsection{Scope of this document}
-    This document describes the processing pipeline implemented in the
-    \fn{usseg} package. It is organised by processing stage. For each stage it
-    states what the stage is trying to achieve, which functions implement it,
-    what data structures flow in and out, and how the raster and DICOM paths
-    differ.\\
-    \\
-    The single-image entry point, \fn{data\_from\_image}, is used as the
-    reference implementation of the core algorithm because it contains the
-    algorithmic path with the least surrounding bookkeeping. The batch pipeline
-    performs the same algorithmic stages and adds file discovery, output
-    writing, annotation rendering, serialisation and report generation.
+  Raster files (JPEG, PNG and similar) have no calibration metadata, so
+  velocity has to be recovered from axis ticks and time from the printed heart
+  rate. DICOM files already carry spatial calibration in the header. The two
+  paths stay separate until the shared segmentation stage
+  (Section~\ref{sec:segmentation}), then split again at digitisation.
 
-  \subsection{Document conventions}
-    Function and module names are written in a monospaced font, for example
-    \fn{segment\_refinement}. Unless stated otherwise, functions named without a
-    module prefix live in \fn{general\_functions.py}, which holds the majority of
-    the algorithmic code.\\
-    \\
-    Image coordinates follow the convention used in the code: arrays are indexed
-    as \texttt{[row, column]}, equivalently \texttt{[y, x]}, with the row index
-    increasing downwards from the top of the image. Consequently a numerically
-    smaller row index is visually higher in the image, which matters when reading
-    the envelope-orientation logic in Section~\ref{sec:segmentation}.
+  Image coordinates match the code: arrays are indexed as
+  \texttt{[row, column]}, equivalently \texttt{[y, x]}, with the row index
+  increasing downwards from the top of the image. A smaller row index is
+  therefore visually higher, which matters for envelope orientation in
+  Section~\ref{sec:segmentation}. Functions named without a module prefix live
+  in \fn{general\_functions.py}. The single-image entry point
+  \fn{data\_from\_image} is the reference for the core algorithm; the batch
+  path runs the same stages and then writes figures, pickles and an HTML
+  report.
 
-  \subsection{Codebase overview}
-    The modules involved in the processing pipeline are:
+  \begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\footnotesize,
+    >=Latex,
+    box/.style={draw, align=center, inner sep=4pt, text width=4.0cm},
+    wide/.style={draw, align=center, inner sep=4pt, text width=8.4cm},
+  ]
+    \node[wide] (infile) at (0,0) {Scan file};
+    \node[box] (rpre) at (-2.25,-1.7)
+      {Raster: OCR, axis ticks, coarse ROI};
+    \node[box] (dpre) at (2.25,-1.7)
+      {DICOM: region tags, $\delta_x$, $\delta_y$};
+    \node[wide] (seg) at (0,-3.45)
+      {Refined mask; three traces (morph, ray, grow)};
+    \node[box] (rdig) at (-2.25,-5.2)
+      {Raster: tick fit; time from heart rate};
+    \node[box] (ddig) at (2.25,-5.2)
+      {DICOM: physical units from the header};
+    \node[wide] (beat) at (0,-6.95)
+      {Beat detection and haemodynamic indices};
+    \node[box] (rsel) at (-2.25,-8.7)
+      {Raster: pick the trace vs OCR};
+    \node[box] (dsel) at (2.25,-8.7)
+      {DICOM: return the primary series};
+    \node[wide] (out) at (0,-10.45)
+      {\texttt{df} and $(x,y)$. Batch also writes PNGs, pickle, HTML};
+
+    \draw[->] (infile.south) -- (rpre.north);
+    \draw[->] (infile.south) -- (dpre.north);
+    \draw[->] (rpre.south) -- (seg.north);
+    \draw[->] (dpre.south) -- (seg.north);
+    \draw[->] (seg.south) -- (rdig.north);
+    \draw[->] (seg.south) -- (ddig.north);
+    \draw[->] (rdig.south) -- (beat.north);
+    \draw[->] (ddig.south) -- (beat.north);
+    \draw[->] (beat.south) -- (rsel.north);
+    \draw[->] (beat.south) -- (dsel.north);
+    \draw[->] (rsel.south) -- (out.north);
+    \draw[->] (dsel.south) -- (out.north);
+  \end{tikzpicture}
+  \caption{Raster and DICOM split for calibration, share the three tracing
+    methods, then split again for units and model selection.}
+  \label{fig:pipeline}
+  \end{figure}
+
+  \subsection{Modules}
+    The processing modules are:
 
     \begin{description}
       \item[\fn{single\_image\_processing.py}] Provides \fn{data\_from\_image},
@@ -118,6 +140,30 @@
 
 \newpage
 \section{Architecture and Entry Points}
+  Run commands from the repository root; \fn{config.toml} is loaded by relative
+  path. Tesseract is required for raster text and axis labels.
+
+  \begin{table}[h]
+  \centering
+  \small
+  \begin{tabular}{@{}p{0.16\textwidth}p{0.40\textwidth}p{0.36\textwidth}@{}}
+  \toprule
+   & Single image & Batch \\
+  \midrule
+  Command & \texttt{data\_from\_image(image\_path=...)} &
+    \texttt{python -m usseg.main} \\
+  Input   & one raster or DICOM path &
+    \fn{root\_dir} in \fn{config.toml} \\
+  Returns & \fn{df}, \fn{(xdata, ydata)} &
+    --- \\
+  Writes  & nothing &
+    PNGs in \fn{output\_dir}; pickles; \fn{generated\_segmented\_data.html} \\
+  \bottomrule
+  \end{tabular}
+  \caption{The two entry points.}
+  \label{tab:io}
+  \end{table}
+
   \subsection{Single-image entry point}
     \fn{data\_from\_image} in \fn{single\_image\_processing.py} processes exactly
     one scan and returns its results in memory without writing any files. It is
@@ -168,10 +214,7 @@ python -m usseg.main
     \fn{output\_dir}, where rendered PNG outputs are written; and a
     \texttt{[pickle]} table naming the intermediate serialisation files. Of the
     three pickle keys, \fn{likely\_us\_images} and \fn{segmented\_data} are used;
-    \fn{patient\_paths} is declared but never read by any module.\\
-    \\
-    The file is loaded by relative path, so all commands must be run from the
-    repository root.
+    \fn{patient\_paths} is declared but never read by any module.
 
   \subsection{Environment prerequisites}
     Text extraction depends on Tesseract OCR, configured by
@@ -192,7 +235,7 @@ python -m usseg.main
     \texttt{.tif}, \texttt{.tiff} and \texttt{.webp}; DICOM extensions are
     \texttt{.dcm} and \texttt{.dicom}. Any other extension raises
     \fn{ValueError} in the single-image path, and is skipped with a warning in
-    the batch path.\\
+    the batch path.
 
     Raster inputs are loaded twice, into a Pillow image and an OpenCV BGR array.
     The Pillow copy is converted to RGB and used for the colour-based operations
@@ -202,9 +245,9 @@ python -m usseg.main
     \fn{extract\_doppler\_from\_dicom}, which return the calibration metadata and
     an image pair cropped to the Doppler region.
 
-  \subsection{Why the two branches diverge}
-    The single most important structural difference is the source of
-    calibration. Table~\ref{tab:modality} summarises how the stages differ.
+  \subsection{Raster versus DICOM}
+    Calibration is why the branches exist. Table~\ref{tab:modality} is the short
+    version of how the stages differ.
 
     \begin{table}[h]
     \centering
@@ -236,21 +279,19 @@ python -m usseg.main
 \newpage
 \section{Stage 1: Text Extraction and OCR Repair}
 \label{sec:ocr}
-  \emph{Raster images only.} This stage is skipped entirely for DICOM input,
-  where the metric panel is generally absent from the extracted Doppler region.\\
-  \\
-  The purpose of this stage is to recover the clinical measurements that the
-  ultrasound machine has already printed on the screen. These values serve two
-  roles: they are reported as the primary metric table, and they act as the
-  reference against which the digitised waveform is later scored, which is what
-  ultimately selects one of the three segmentation models.
+  \emph{Raster images only;} skipped for DICOM, where the metric panel is
+  generally absent from the extracted Doppler region.
+
+  This stage recovers the measurements already printed on the screen. They
+  populate the primary metric table and later score the three traces, which is
+  how one segmentation model is selected.
 
   \subsection{Metric panel isolation: \fn{colour\_extract\_vectorized}}
     On the supported machines the metric panel is rendered in a distinctive
     yellow. Rather than thresholding brightness, the code isolates that colour
     geometrically: the target colour defines the axis of a cylinder in RGB space,
-    and a pixel is retained if it falls inside that cylinder.\\
-    \\
+    and a pixel is retained if it falls inside that cylinder.
+
     The target is $[255, 255, 100]$ with both \fn{cyl\_length} and
     \fn{cyl\_radius} set to $95$. The axis direction is obtained from
     \fn{append\_spherical\_1point}, which expresses the target colour in
@@ -267,8 +308,8 @@ python -m usseg.main
     where $v = \fn{end} - \fn{start}$. Matching pixels are set to white and all
     others to black, producing a binary mask image. Because the test is a
     distance in colour space rather than a per-channel range, it tolerates the
-    brightness variation of anti-aliased text.\\
-    \\
+    brightness variation of anti-aliased text.
+
     An earlier non-vectorised implementation, \fn{colour\_extract}, remains in the
     module but is no longer used.
 
@@ -393,8 +434,8 @@ python -m usseg.main
     captures any trailing non-numeric group as the unit. Spaces are removed from
     the captured number before conversion. A matched label with no parseable
     number yields a row with a zero value rather than being dropped, so that the
-    metric's absence is visible downstream.\\
-    \\
+    metric's absence is visible downstream.
+
     There is no character-level substitution table (for instance mapping a
     misread \texttt{S} to \texttt{5}). Instead, misplaced decimal points are
     repaired by magnitude: a value that is implausible by an order of magnitude is
@@ -409,15 +450,15 @@ python -m usseg.main
   \subsection{Heart rate refinement}
     Heart rate deserves special treatment because it is the only quantity that
     calibrates the raster time axis (Section~\ref{sec:digitisation}); an error
-    here propagates into every time-dependent result.\\
-    \\
+    here propagates into every time-dependent result.
+
     After the first pass, \fn{refine\_hr\_from\_local\_roi} re-reads the heart
     rate from a locally enhanced crop. The ROI around the HR line is padded by
     $\max(15,\,35\%)$ of its width and $\max(10,\,80\%)$ of its height, then
     equalised, blurred, Otsu-thresholded and upscaled by a factor of two before a
     constrained OCR pass using \fn{psm 7} with a character whitelist, falling back
-    to \fn{psm 6}. Candidates are accepted only within $20$--$240$\,bpm.\\
-    \\
+    to \fn{psm 6}. Candidates are accepted only within $20$--$240$\,bpm.
+
     The reconciliation rule is conservative. The refined value replaces the first
     pass only if the first-pass value is implausible; if both are plausible but
     differ by more than $3$\,bpm the first-pass value is kept and a warning is
@@ -431,8 +472,8 @@ python -m usseg.main
     \fn{metric\_check\_ophthalmic} for ophthalmic, and \fn{metric\_check\_dv} for
     ductus venosus. All of them preserve the original readings in a
     \texttt{Raw Value} column before making corrections, so that repairs remain
-    auditable.\\
-    \\
+    auditable.
+
     \fn{metric\_check} recomputes the three derived quantities from the extracted
     peak-systolic and end-diastolic velocities,
     \[
@@ -443,16 +484,16 @@ python -m usseg.main
     and compares each with the extracted value at a tolerance of $0.5$. Time
     averaged maximum velocity is treated specially: it is accepted if its
     magnitude simply lies between $ED$ and $PS$, because the closed-form estimate
-    above is only an approximation.\\
-    \\
+    above is only an approximation.
+
     The outcome depends on how many of the three agree. If all three agree,
     nothing is changed. If one or two agree, the disagreeing or missing fields are
     recomputed from the corrected velocities. If none agree, the code assumes $PS$
     is correct and back-solves $ED$ from the reported ratio or resistive index;
     should both resulting candidates fall below $2$, it reverses the assumption,
     treats $ED$ as correct and recomputes $PS$. This is the most aggressive repair
-    in the pipeline and the primary reason the raw values are retained.\\
-    \\
+    in the pipeline and the primary reason the raw values are retained.
+
     The ophthalmic and ductus venosus variants follow the same pattern with
     different tolerances and formulae: ophthalmic uses $0.5$ for the ratio and
     $0.1$ for the resistive index, while ductus venosus uses $0.2$ for $S/a$ and
@@ -469,8 +510,8 @@ python -m usseg.main
     waveform panel in a raster screenshot. It exploits the fact that the
     waveform and its surrounding trace are rendered in near-neutral greys, so
     they can be separated from coloured annotation and from the dark background
-    by a colour-neutrality test rather than by brightness alone.\\
-    \\
+    by a colour-neutrality test rather than by brightness alone.
+
     The function iterates over every pixel of the RGB image and retains the
     pixel only if the spread across the three channels is small and the pixel is
     reasonably bright:
@@ -483,8 +524,8 @@ python -m usseg.main
     Pixels satisfying both conditions are set to white and all others to black.
     A band at the top of the image is then forced to black to suppress the
     header region: rows above 500 for images taller than 600 pixels, and rows
-    above 20 otherwise.\\
-    \\
+    above 20 otherwise.
+
     The resulting binary image is cleaned by removing small objects and small
     holes at a size threshold of 199 pixels, followed by two erosions and one
     dilation. The erosions detach tick marks that touch the waveform body and
@@ -492,8 +533,8 @@ python -m usseg.main
     with \fn{skimage.measure.find\_contours}, and the returned bounds
     \fn{Xmin}, \fn{Xmax}, \fn{Ymin} and \fn{Ymax} are the extremes across
     \emph{all} contours, that is the bounding box of every surviving object
-    rather than of a single selected component.\\
-    \\
+    rather than of a single selected component.
+
     Two practical consequences follow. First, because the bounding box spans all
     surviving contours, residual bright artefacts inside the search area widen
     the reported region. Second, the per-pixel Python loop makes this one of the
@@ -540,8 +581,8 @@ python -m usseg.main
     coordinates), \fn{ROIAX} (the axis ROI cropped so that it contains the labels
     but not the tick strokes) and \fn{TYLshift} (the offset used for that crop).
     The remainder are intermediate images and pass-through arguments consumed by
-    \fn{search\_for\_labels}.\\
-    \\
+    \fn{search\_for\_labels}.
+
     The algorithm is:
 
     \begin{enumerate}
@@ -647,8 +688,8 @@ maxID = np.argmax(peaks)
     \fn{validate\_axis\_ticks} cleans a single side's ticks. It never mutates its
     inputs and returns a corrected copy. Values that cannot be parsed as floats
     are skipped, and if fewer than two ticks remain, or the value and position
-    counts disagree, the inputs are returned unchanged.\\
-    \\
+    counts disagree, the inputs are returned unchanged.
+
     Ticks are sorted by pixel row and then repeatedly filtered until stable:
 
     \begin{itemize}
@@ -663,7 +704,7 @@ maxID = np.argmax(peaks)
         endpoint. Any more complex pattern only logs a warning and stops, on the
         principle that it is safer to keep suspect ticks than to guess.
     \end{itemize}
-    One caveat worth recording: the function computes monotonicity flags for the
+    One caveat: the function computes monotonicity flags for the
     ordered values but does not act on them. A non-monotonic set of tick values is
     therefore not rejected on that basis alone, and is only corrected if it also
     produces an anomalous slope pattern.
@@ -684,8 +725,8 @@ maxID = np.argmax(peaks)
     straight line of row against value with \fn{numpy.polyfit} and returns the
     intercept at zero. The fit matters because it recovers the baseline even when
     it is off-screen or unlabelled, which is common when a display shows only
-    positive velocities.\\
-    \\
+    positive velocities.
+
     \fn{estimate\_zero\_line\_y} then fuses the two sides. With one side available
     it returns that estimate. With both, it prefers whichever side has at least
     three ticks when the other has fewer; if the sides are comparable it warns
@@ -700,8 +741,8 @@ maxID = np.argmax(peaks)
     first region whose Region Spatial Format and Region Data Type are both $3$,
     identifying the pulsed-wave spectral region. From that region it reads the
     bounding box, the reference pixel, the reference physical values and the
-    physical deltas, listed in Table~\ref{tab:dicomtags}.\\
-    \\
+    physical deltas, listed in Table~\ref{tab:dicomtags}.
+
     \begin{table}[h]
     \centering
     \small
@@ -738,9 +779,8 @@ maxID = np.argmax(peaks)
     \fn{try}/\fn{except}, initialising \fn{Lnumber}, \fn{Lpositions},
     \fn{Rnumber} and \fn{Rpositions} to \fn{None} beforehand. A side that fails
     leaves its variables as \fn{None} and the pipeline proceeds on the other
-    side. This is what allows scans that label only one axis to be processed at
-    all, and it is by design rather than by accident.\\
-    \\
+    side. That is how scans that label only one axis still get processed.
+
     The cost is diagnostic noise. In \fn{segment\_files.py} the handlers call
     \fn{traceback.print\_exc()} in addition to logging, so an entirely expected
     single-sided scan still prints full tracebacks for every image processed. The
@@ -750,12 +790,10 @@ maxID = np.argmax(peaks)
 \newpage
 \section{Stage 4: Waveform Segmentation and the Three Tracing Methods}
 \label{sec:segmentation}
-  This is the algorithmic core of the package and it is shared by both
-  modalities. It proceeds in two parts. First a single refined binary mask of the
-  waveform body is produced. Then \emph{three independent methods} extract a
-  one-pixel-per-column trace of the waveform envelope. All three are computed
-  for every scan; the choice between them is deferred to
-  Section~\ref{sec:selection}.
+  This stage is shared by both modalities. First a refined binary mask of the
+  waveform body, then \emph{three independent methods} each extract a
+  one-pixel-per-column envelope trace. All three are computed for every scan;
+  which one is returned is decided in Section~\ref{sec:selection}.
 
   \subsection{Orchestration: \fn{segment\_refinement}}
     \fn{segment\_refinement} is the single entry point for this stage and is
@@ -810,8 +848,8 @@ maxID = np.argmax(peaks)
     the diagnostic envelope. This decision, held in the variable \fn{keep} with
     value \texttt{"upper"} or \texttt{"lower"}, is made once in
     \fn{\_morphological\_top\_curve\_from\_mask} and then \emph{reused} for the
-    ray tracer, ensuring that all methods trace the same side of the waveform.\\
-    \\
+    ray tracer, ensuring that all methods trace the same side of the waveform.
+
     When a zero line is available the mask outline rows are counted above and
     below it, and the waveform is treated as inverted when more of the outline
     lies below the baseline. Rows on the non-diagnostic side are then cleared.
@@ -824,16 +862,16 @@ maxID = np.argmax(peaks)
   \subsection{Method 1: Morphological envelope}
   \label{sec:morph}
     Implemented by \fn{\_morphological\_top\_curve\_from\_mask}. This is the
-    original method and the only one guaranteed to be produced.\\
-    \\
+    original method and the only one guaranteed to be produced.
+
     The mask is eroded once and the erosion subtracted from the original,
     $\text{outline} = \text{mask} - \text{erosion}(\text{mask})$, leaving a
     one-pixel shell around the waveform body. The non-diagnostic side is cleared
     as described in Section~\ref{sec:keep}, and
     \fn{keep\_one\_pixel\_per\_column} reduces the shell to a single pixel per
     column, taking the visually uppermost or lowermost pixel according to
-    \fn{keep}.\\
-    \\
+    \fn{keep}.
+
     The method is fast, deterministic and entirely dependent on the quality of
     the refined mask. Because the mask has been Gaussian-smoothed, the resulting
     trace is smooth but can be blunted at sharp systolic peaks, and any
@@ -845,8 +883,8 @@ maxID = np.argmax(peaks)
     primary metric source downstream. Rather than deriving the envelope from a
     binary mask, this method re-examines the original image column by column,
     which allows it to follow a faint envelope that global thresholding would
-    lose.\\
-    \\
+    lose.
+
     Its region of interest is computed by
     \fn{ray\_trace\_roi\_from\_refined\_mask} from the bounding box of the
     refined mask, padded by $\max(8, 3\%)$ of the box width horizontally,
@@ -854,8 +892,8 @@ maxID = np.argmax(peaks)
     15 pixels horizontally. The generous top padding exists so that peaks
     excluded from the refined mask remain inside the search area. A further hard
     inset of 20 pixels per side is applied inside the tracer itself to exclude
-    border artefacts.\\
-    \\
+    border artefacts.
+
     The algorithm then proceeds as follows.
 
     \begin{enumerate}
@@ -999,8 +1037,8 @@ Xplot, Yplot, Ynought, Xplot_o, Yplot_o, Xplot_g, Yplot_g
   \end{lstlisting}
   where the unsuffixed pair is the primary series, \fn{\_o} the overlay and
   \fn{\_g} the region-grow series. \fn{Ynought} carries the zero-velocity
-  reference. Keeping the signature identical is what allows the two branches to
-  reconverge for the remaining stages.
+  reference. Same return signature, so the later stages do not care which
+  branch produced the tuple.
 
   \subsection{Condensing the curve to one sample per column}
     Both branches begin with the same reduction. A trace arrives as a list of
@@ -1017,11 +1055,10 @@ Xplot, Yplot, Ynought, Xplot_o, Yplot_o, Xplot_g, Yplot_g
     usable, it is used; if both are usable, \fn{validate\_axis\_pair} is consulted
     and the side with more ticks is selected either way, with a warning logged when
     the sides disagree. If neither side is usable the function returns empty
-    series and logs an error. In other words tick count, not agreement, decides
-    the outcome; agreement only affects logging. This is a deliberate choice to
-    keep processing possible on partially labelled scans, and the disagreement
-    warning is the signal to inspect such a scan manually.\\
-    \\
+    series and logs an error. Tick count, not agreement, decides the outcome, so
+    partially labelled scans still calibrate; disagreement only logs a warning,
+    which is the signal to inspect those scans.
+
     Calibration itself is a two-point fit rather than a least-squares fit over all
     ticks. The $(\text{row}, \text{value})$ pairs are sorted by row and the line is
     taken through the extreme pair only:
@@ -1035,8 +1072,8 @@ Xplot, Yplot, Ynought, Xplot_o, Yplot_o, Xplot_g, Yplot_g
     quantisation on the slope, but it also means a single mislocated endpoint tick
     corrupts the entire scale. This is precisely the failure that
     \fn{validate\_axis\_ticks} exists to prevent, which is why its endpoint-drop
-    rules matter more than they might appear to.\\
-    \\
+    rules matter more than they might appear to.
+
     Interior ticks are used for validation but not for the fit; the code proceeds
     only if there are at least two ticks and the first and last rows differ.
 
@@ -1071,12 +1108,11 @@ Xplot, Yplot, Ynought, Xplot_o, Yplot_o, Xplot_g, Yplot_g
     computes this from the ray series and the OCR dataframe, and
     \fn{scale\_raster\_digitized\_x} applies it to each series in turn. When the
     heart rate is missing or non-positive, or when foot spacing cannot be
-    determined, the factor is $1.0$ and the axis remains arbitrary.\\
-    \\
-    This is the single most important dependency between stages: OCR failure on
-    the heart rate line silently leaves the time axis uncalibrated. It also means
-    the raster time axis inherits any error in the printed heart rate, which is
-    why \fn{refine\_hr\_from\_local\_roi} is worth its extra OCR pass.
+    determined, the factor is $1.0$ and the axis remains arbitrary.
+
+    OCR failure on the heart rate line silently leaves the time axis
+    uncalibrated, and a plausible-but-wrong printed rate is inherited as well.
+    That is why \fn{refine\_hr\_from\_local\_roi} is worth its extra OCR pass.
 
   \subsection{DICOM: mapping pixels using physical deltas}
     The DICOM branch needs no fitting because the display geometry is recorded in
@@ -1098,11 +1134,11 @@ Xplot, Yplot, Ynought, Xplot_o, Yplot_o, Xplot_g, Yplot_g
     of what the header states, because image rows
     increase downwards while velocity increases upwards. Consequently the DICOM
     branch has no need for the negative-mean inversion used on raster images, and
-    does not apply it.\\
-    \\
+    does not apply it.
+
     \fn{Ynought} is set to \fn{[ReferencePixelPhysicalValueY]}, defaulting to
-    $0.0$, whereas the raster branch always returns \fn{[0.0]}.\\
-    \\
+    $0.0$, whereas the raster branch always returns \fn{[0.0]}.
+
     The essential consequence is that DICOM $X$ is in physical units immediately,
     with no dependence on OCR, on beat detection or on the printed heart rate.
     Table~\ref{tab:calibcompare} summarises the difference.
@@ -1137,8 +1173,8 @@ Xplot, Yplot, Ynought, Xplot_o, Yplot_o, Xplot_g, Yplot_g
     smooths the remainder. The window is $10\%$ of the series length clamped to
     $[7, 21]$ and forced odd, with polynomial order $3$ reduced if the window is
     too short. A rolling median is used as a fallback when the window would be
-    smaller than five samples or the filter raises.\\
-    \\
+    smaller than five samples or the filter raises.
+
     A Savitzky--Golay filter is chosen over a moving average because it fits a
     local polynomial and therefore preserves peak height and curvature, which is
     essential when the peak values themselves are the measurements of interest.
@@ -1301,15 +1337,13 @@ Xplot, Yplot, Ynought, Xplot_o, Yplot_o, Xplot_g, Yplot_g
     All are rounded to two decimal places, and each guards against a zero or
     non-finite denominator by returning $0.0$.
 
-    Two points deserve emphasis. First, $TA_{\max}$ is the temporal mean of the
-    whole digitised envelope, not of complete beats only, so a partial beat at
-    either end of the trace biases both $TA_{\max}$ and $PI$; the batch plots shade
-    incomplete beats for exactly this reason. Second,
-    \fn{tamax\_from\_ps\_ed\_approximation}, which computes
-    $(PS + 2\,ED)/3$, is a legacy surrogate used only by the OCR consistency
-    checks of Section~\ref{sec:ocr}, where no envelope is available. It is not used
-    on any digitised path, and the two must not be conflated when comparing
-    digitised and OCR values.
+    $TA_{\max}$ is the temporal mean of the whole digitised envelope, not of
+    complete beats only, so a partial beat at either end biases both $TA_{\max}$
+    and $PI$; the batch plots shade incomplete beats for that reason.
+    \fn{tamax\_from\_ps\_ed\_approximation}, which computes $(PS + 2\,ED)/3$, is
+    a legacy surrogate used only by the OCR consistency checks of
+    Section~\ref{sec:ocr}, where no envelope is available. It is not used on any
+    digitised path.
 
     Heart rate is not computed from the digitised trace. On the raster path it is
     an input, read by OCR and used to calibrate time; on the DICOM path it is
@@ -1318,16 +1352,13 @@ Xplot, Yplot, Ynought, Xplot_o, Yplot_o, Xplot_g, Yplot_g
 \newpage
 \section{Stage 7: Model Comparison and Selection}
 \label{sec:selection}
-  Stage 4 produces three candidate traces and the pipeline must return one. The
-  criterion is agreement with the machine's own printed measurements: whichever
-  trace reproduces the OCR values most closely is assumed to have segmented the
-  envelope most faithfully. This makes the OCR stage not merely a reporting
-  convenience but the arbiter of segmentation quality, and it is why an
-  \fn{Fail} flag from Section~\ref{sec:ocr} degrades the result even though the
-  segmentation itself succeeded.
+  Stage 4 produces three traces; this stage picks one by how closely each
+  reproduces the printed OCR values. A \fn{Fail} flag from
+  Section~\ref{sec:ocr} therefore degrades the result even when segmentation
+  itself succeeded: there is nothing to score against.
 
-  \emph{This stage applies to raster images only.} The DICOM path has no
-  independent ground truth and is discussed at the end of the section.
+  \emph{Raster images only.} The DICOM path has no independent ground truth
+  and is discussed at the end of the section.
 
   \subsection{Mapping digitised values into the metric table}
     \fn{plot\_correction} inserts three empty columns into the OCR dataframe at
@@ -1445,16 +1476,13 @@ Xplot, Yplot, Ynought, Xplot_o, Yplot_o, Xplot_g, Yplot_g
     series supplied by the caller — which, per Section~\ref{sec:asymmetry},
     differs between the two entry points.
 
-    A structural consequence deserves attention. Because DICOM files carry no
-    printed metric panel in the extracted region, the \texttt{Value} column of the
-    resulting dataframe is populated with the computed primary metrics rather than
-    with an independent measurement. The HTML report nonetheless applies the same
-    traffic-light styling, comparing each digitised column against
-    \texttt{Value}. The primary column therefore always scores perfect green, since
-    it is being compared with itself, and the other two columns are scored against
-    the primary rather than against any ground truth. The colours remain useful as
-    an indication of agreement \emph{between} the three segmentation methods, but
-    they must not be read as accuracy.
+    Because DICOM files carry no printed metric panel in the extracted region,
+    the \texttt{Value} column is populated with the computed primary metrics
+    rather than an independent measurement. The HTML report still applies the
+    same traffic-light styling against \texttt{Value}, so the primary column
+    always scores perfect green (it is compared with itself) and the other two
+    are scored against the primary. The colours show agreement \emph{between}
+    methods, not accuracy.
 
 \newpage
 \section{Batch Pipeline and Outputs}
@@ -1491,11 +1519,11 @@ prof(usseg.generate_html_from_pkl)
 
     Accepted files are grouped into a dictionary keyed by a patient identifier
     scraped from the file path with a regular expression, and that dictionary is
-    pickled to \fn{likely\_us\_images}. Two details are worth recording. First,
-    the identifier pattern differs by modality: \fn{\textbackslash d\{4\}} for
-    DICOM and \fn{\textbackslash d\{3\}} for raster, so the same directory tree can
-    yield inconsistent grouping. Second, the function returns a \emph{flattened}
-    list of paths, discarding the grouping, which is preserved only in the pickle.
+    pickled to \fn{likely\_us\_images}. The identifier pattern differs by
+    modality: \fn{\textbackslash d\{4\}} for DICOM and \fn{\textbackslash d\{3\}}
+    for raster, so the same directory tree can yield inconsistent grouping. The
+    function then returns a \emph{flattened} list of paths, discarding the
+    grouping, which is preserved only in the pickle.
     Downstream code therefore processes scans independently, with no per-patient
     aggregation.
 
@@ -1722,19 +1750,15 @@ prof(usseg.generate_html_from_pkl)
     it also plots the extracted trace, which is the quickest way to sanity-check a
     change to the segmentation code.
 
-  \subsection{Diagnostics and figure conventions}
-    Figures are addressed by number: figure 1 is the annotated scan and figure 2
-    the digitised waveforms. Traces are coloured consistently throughout —
-    morphological in blue (\fn{\#1f77b4}), ray tracing in red, and region growing
-    in violet (\fn{\#b026ff}) — and the same convention is used in this document.
-    Several functions accept a \fn{debug\_plots} argument that renders intermediate
-    masks; these are off by default because the batch path saves a fixed set of
-    figures instead.
+  \subsection{Diagnostics}
+    Batch figures are numbered: 1 is the annotated scan, 2 the digitised
+    waveforms. Morphological traces are blue (\texttt{\#1f77b4}), ray tracing
+    red, region growing violet (\texttt{\#b026ff}). \fn{debug\_plots} arguments
+    are off by default; the batch path saves a fixed set of figures instead.
 
 \newpage
 \section{Recommended Follow-Up}
-  The following items were identified while documenting the pipeline. They are
-  listed in rough order of how much they affect interpretation of the results.
+  Rough order of how much each item affects interpretation of the results.
 
   \begin{enumerate}
     \item \textbf{Reconcile the traffic-light thresholds with their docstrings}

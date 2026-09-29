@@ -283,6 +283,8 @@ SHOW_GROW_DEBUG_PLOTS = False
 SHOW_MORPH_DEBUG_PLOTS = False
 # Ray tracing: Method-2 main-steps figure (k-means → yellow → picks → smooth).
 SHOW_RAY_DEBUG_PLOTS = False
+# Axis tick / label search: ROI, tick-object filter, column score, retained ticks, OCR boxes.
+SHOW_TICK_LABEL_DEBUG_PLOTS = True
 # Disk radius (pixels) for binary erosion of the refined mask before region-grow.
 # 0 disables. Shrinking the seed avoids over-thick refined blobs dominating seed
 # statistics and lets growth fill troughs; if erosion removes all seeds, the
@@ -2700,16 +2702,16 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
                 int(right_dimensions[2]): int(right_dimensions[3]),
                 int(right_dimensions[0]): int(right_dimensions[1]),
                 ]  # Left ROI
-        #plt.figure(figsize=(12, 8))
-        #plt.imshow(ROIAX, cmap="gray")
-        #plt.title("Right axis ROI after grayscale threshold")
-        #plt.axis("off")
-        #plt.show()
+
+    if SHOW_TICK_LABEL_DEBUG_PLOTS:
+        plt.figure(figsize=(12, 8))
+        plt.imshow(ROIAX, cmap="gray")
+        plt.title(f"{side} axis ROI after grayscale threshold")
+        plt.axis("off")
+        plt.show()
 
     ROI2 = np.zeros(np.shape(ROIAX))
     ROI3 = np.zeros(np.shape(ROIAX))
-    # plt.imshow(ROI)
-    # plt.show()
 
     contours, hierarchy = cv2.findContours(
         ROIAX, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
@@ -2742,8 +2744,8 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
             if min_tick_area <= area <= max_tick_area and height < max_tick_height:
                 tick_objects.append(idx)
         
-        # Visualize tick objects (for debugging - comment out when not needed)
-        if tick_objects:
+        # Visualize tick objects when debug flag is on
+        if SHOW_TICK_LABEL_DEBUG_PLOTS and tick_objects:
             tick_mask = np.zeros_like(W_right, dtype=bool)
             for tick_idx in tick_objects:
                 tick_mask[labels == tick_idx] = True
@@ -2753,11 +2755,14 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
             vis_image[W_right] = [128, 128, 128]  # Gray for all objects
             vis_image[tick_mask] = [255, 0, 0]  # Red for tick objects
             
-            #plt.figure(figsize=(12, 8))
-            #plt.imshow(vis_image)
-            #plt.title(f'Right axis ROI: Tick objects (red) vs all objects (gray)\nFound {len(tick_objects)} tick objects')
-            #plt.axis('off')
-            #plt.show()
+            plt.figure(figsize=(12, 8))
+            plt.imshow(vis_image)
+            plt.title(
+                f"Right axis ROI: Tick objects (red) vs all objects (gray)\n"
+                f"Found {len(tick_objects)} tick objects"
+            )
+            plt.axis("off")
+            plt.show()
         
         # For each column, count how many tick objects touch it
         roi_height, roi_width = ROI2.shape
@@ -2779,14 +2784,15 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
         for Column in columns_to_remove:
             ROI2[:, Column] = 0
 
-        #plt.figure(figsize=(12, 8))
-        #plt.imshow(ROI2, cmap="gray")
-        #plt.title(
-        #    f"Right axis contour mask after column filter\n"
-        #    f"Removed {len(columns_to_remove)} / {roi_width} columns"
-        #)
-        #plt.axis("off")
-        #plt.show()
+        if SHOW_TICK_LABEL_DEBUG_PLOTS:
+            plt.figure(figsize=(12, 8))
+            plt.imshow(ROI2, cmap="gray")
+            plt.title(
+                f"Right axis contour mask after column filter\n"
+                f"Removed {len(columns_to_remove)} / {roi_width} columns"
+            )
+            plt.axis("off")
+            plt.show()
 
     ROI2 = ROI2.astype(np.uint8)
     contours, hierarchy = cv2.findContours(
@@ -2848,9 +2854,9 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
     TGT = peaks[maxID]
     # TGT = all.index(max(all)) # The target is the X coord that most object lie on.
 
-    if side == "Right":
-        #plt.figure(figsize=(12, 4))
-        #plt.plot(all, color="black", linewidth=1.2, label="tick-object count")
+    if SHOW_TICK_LABEL_DEBUG_PLOTS:
+        plt.figure(figsize=(12, 4))
+        plt.plot(all, color="black", linewidth=1.2, label="tick-object count")
         if len(peaks) > 0:
             plt.plot(peaks, np.asarray(all)[peaks], "rx", label="candidate peaks")
             plt.axvline(
@@ -2860,13 +2866,13 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
                 linewidth=1.5,
                 label=f"selected TGT={TGT}",
             )
-        #plt.title("Right axis column score profile")
-        #plt.xlabel("Column within right ROI")
-        #plt.ylabel("Tick-object count")
-        #plt.grid(True, alpha=0.3)
-        #plt.legend(loc="best")
-        #plt.tight_layout()
-        #plt.show()
+        plt.title(f"{side} axis column score profile")
+        plt.xlabel("Column within axis ROI")
+        plt.ylabel("Tick-object count")
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc="best")
+        plt.tight_layout()
+        plt.show()
 
     for id in ids:
         Ctest = np.reshape(Cs[id], (-1, 2))
@@ -2908,20 +2914,23 @@ def search_for_ticks(input_image_obj, side, left_dimensions, right_dimensions):
                 [int((MAXX + MINX) / 2), int((MAXY + MINY) / 2)]
             )  # Calc center point as (0.5*(MaxX+MinX),0.5*(MaxY+MinY))
 
-    #if side == "Right":
-        #fig, ax = plt.subplots(figsize=(12, 8))
-        #ax.imshow(ROI2, cmap="gray")
-        #for contour in BCs:
-        #    pts = np.reshape(contour, (-1, 2))
-        #    ax.plot(pts[:, 0], pts[:, 1], color="cyan", linewidth=1.0)
-        #if len(CenPoints) > 0:
-        #    cen = np.asarray(CenPoints)
-        #    ax.scatter(cen[:, 0], cen[:, 1], c="yellow", s=24, label="tick centres")
-        #ax.axvline(TGT, color="red", linestyle="--", linewidth=1.5, label=f"TGT={TGT}")
-        #ax.set_title(f"Right axis filtered contours kept on target column\nSelected ticks: {len(BCs)}")
-        #ax.axis("off")
-        #ax.legend(loc="best")
-        #plt.show()
+    if SHOW_TICK_LABEL_DEBUG_PLOTS:
+        fig, ax = plt.subplots(figsize=(12, 8))
+        ax.imshow(ROI2, cmap="gray")
+        for contour in BCs:
+            pts = np.reshape(contour, (-1, 2))
+            ax.plot(pts[:, 0], pts[:, 1], color="cyan", linewidth=1.0)
+        if len(CenPoints) > 0:
+            cen = np.asarray(CenPoints)
+            ax.scatter(cen[:, 0], cen[:, 1], c="yellow", s=24, label="tick centres")
+        ax.axvline(TGT, color="red", linestyle="--", linewidth=1.5, label=f"TGT={TGT}")
+        ax.set_title(
+            f"{side} axis filtered contours kept on target column\n"
+            f"Selected ticks: {len(BCs)}"
+        )
+        ax.axis("off")
+        ax.legend(loc="best")
+        plt.show()
 
     def reject_outliers(data, m=8.0):
         d = np.abs(data - np.median(data))
@@ -3285,6 +3294,29 @@ def search_for_labels(
           int(Right_dimensions[2]): int(Right_dimensions[3]),
           int(Right_dimensions[0]): int(Right_dimensions[1]),
         ] = ROI3  # Left ROI
+
+    if SHOW_TICK_LABEL_DEBUG_PLOTS:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        axes[0].imshow(ROIAX, cmap="gray")
+        axes[0].set_title(f"{Side} label OCR ROI")
+        axes[0].axis("off")
+        axes[1].imshow(ROI3, cmap="gray")
+        if len(CenBox) > 0:
+            cb = np.asarray(CenBox, dtype=float)
+            axes[1].scatter(cb[:, 0], cb[:, 1], c="cyan", s=30, label="label centres")
+            for txt, (cx, cy) in zip(label_texts, CenBox):
+                axes[1].text(cx + 2, cy, str(txt), color="yellow", fontsize=8)
+        if len(CenPoints) > 0:
+            cp = np.asarray(CenPoints, dtype=float)
+            axes[1].scatter(cp[:, 0], cp[:, 1], c="red", s=24, marker="x", label="tick centres")
+        axes[1].set_title(
+            f"{Side} labels (boxes) + tick centres\n"
+            f"labels={len(label_texts)}, ticks={len(CenPoints)}"
+        )
+        axes[1].axis("off")
+        axes[1].legend(loc="best", fontsize=8)
+        fig.tight_layout()
+        plt.show()
 
     return ROIAX, number, positions, empty_to_fill
 
