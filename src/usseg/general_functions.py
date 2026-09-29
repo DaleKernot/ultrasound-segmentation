@@ -284,7 +284,7 @@ SHOW_MORPH_DEBUG_PLOTS = False
 # Ray tracing: Method-2 main-steps figure (k-means → yellow → picks → smooth).
 SHOW_RAY_DEBUG_PLOTS = False
 # Axis tick / label search: ROI, tick-object filter, column score, retained ticks, OCR boxes.
-SHOW_TICK_LABEL_DEBUG_PLOTS = True
+SHOW_TICK_LABEL_DEBUG_PLOTS = False
 # Disk radius (pixels) for binary erosion of the refined mask before region-grow.
 # 0 disables. Shrinking the seed avoids over-thick refined blobs dominating seed
 # statistics and lets growth fill troughs; if erosion removes all seeds, the
@@ -1590,11 +1590,14 @@ def _plot_grow_main_steps_debug(
     Ymin,
     Ymax,
     yellow_forbidden_mask=None,
+    allowed_before_kmeans=None,
+    kmeans_signal_mask=None,
+    allowed_after_kmeans=None,
     roi_pad=24,
 ):
     """
-    Method 3 (pipeline_overview): refined body → eroded seed → constrained
-    grow → envelope thinned like morph. Overlay-focused main steps.
+    Method 3 (pipeline_overview): k-means gate → refined body → eroded seed →
+    constrained grow → envelope. Overlay-focused main steps.
     """
     rgb = cv2.cvtColor(np.asarray(input_image_bgr), cv2.COLOR_BGR2RGB)
     h, w = rgb.shape[:2]
@@ -1625,50 +1628,101 @@ def _plot_grow_main_steps_debug(
         if yellow_forbidden_mask is not None
         else np.zeros((h, w), dtype=bool)
     )
+    allowed_before = (
+        np.asarray(allowed_before_kmeans, dtype=bool)
+        if allowed_before_kmeans is not None
+        else np.zeros((h, w), dtype=bool)
+    )
+    kmeans_signal = (
+        np.asarray(kmeans_signal_mask, dtype=bool)
+        if kmeans_signal_mask is not None
+        else np.zeros((h, w), dtype=bool)
+    )
+    allowed_after = (
+        np.asarray(allowed_after_kmeans, dtype=bool)
+        if allowed_after_kmeans is not None
+        else (allowed_before & kmeans_signal if np.any(kmeans_signal) else allowed_before)
+    )
+    removed_bg = allowed_before & (~allowed_after)
 
     rgb_c = crop(rgb)
-    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+    fig, axes = plt.subplots(3, 3, figsize=(16, 13))
 
-    axes[0, 0].imshow(rgb_c)
-    tint = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
-    tint[crop(refined)] = mcolors.to_rgba(MORPH_CURVE_COLOR, alpha=0.35)
-    axes[0, 0].imshow(tint)
-    axes[0, 0].set_title("1. Input: refined mask\n(grow starts from this body)", fontsize=9)
-    axes[0, 0].axis("off")
+    def _overlay(ax, mask, color, alpha, title):
+        ax.imshow(rgb_c)
+        if np.any(crop(mask)):
+            tint = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
+            tint[crop(mask)] = mcolors.to_rgba(color, alpha=alpha)
+            ax.imshow(tint)
+        ax.set_title(title, fontsize=9)
+        ax.axis("off")
 
-    axes[0, 1].imshow(rgb_c)
-    tint = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
-    tint[crop(seed)] = mcolors.to_rgba("lime", alpha=0.45)
-    axes[0, 1].imshow(tint)
-    axes[0, 1].set_title(
-        f"2. Seed (eroded ∩ allowed)\nr={GROW_SEED_EROSION_RADIUS}",
+    _overlay(
+        axes[0, 0],
+        allowed_before,
+        "deepskyblue",
+        0.35,
+        "1. Before k-means\n(ROI allowed mask)",
+    )
+    _overlay(
+        axes[0, 1],
+        kmeans_signal,
+        "limegreen",
+        0.40,
+        "2. k-means signal\n(k=3, ¬background)",
+    )
+    axes[0, 2].imshow(rgb_c)
+    if np.any(crop(allowed_after)):
+        kept = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
+        kept[crop(allowed_after)] = mcolors.to_rgba("limegreen", alpha=0.35)
+        axes[0, 2].imshow(kept)
+    if np.any(crop(removed_bg)):
+        gone = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
+        gone[crop(removed_bg)] = mcolors.to_rgba("red", alpha=0.40)
+        axes[0, 2].imshow(gone)
+    axes[0, 2].set_title(
+        "3. After k-means gate\n(green=kept, red=removed bg)",
         fontsize=9,
     )
-    axes[0, 1].axis("off")
-
-    axes[0, 2].imshow(rgb_c)
-    if np.any(crop(yellow)):
-        yt = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
-        yt[crop(yellow)] = mcolors.to_rgba("orange", alpha=0.45)
-        axes[0, 2].imshow(yt)
-    axes[0, 2].set_title("3. Forbidden yellow (raster)", fontsize=9)
     axes[0, 2].axis("off")
 
-    axes[1, 0].imshow(rgb_c)
-    tint = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
-    tint[crop(grown)] = mcolors.to_rgba(GROW_CURVE_COLOR, alpha=0.40)
-    axes[1, 0].imshow(tint)
-    axes[1, 0].set_title("4. Grown region (BFS)", fontsize=9)
-    axes[1, 0].axis("off")
+    _overlay(
+        axes[1, 0],
+        refined,
+        MORPH_CURVE_COLOR,
+        0.35,
+        "4. Input: refined mask\n(grow starts from this body)",
+    )
+    _overlay(
+        axes[1, 1],
+        seed,
+        "lime",
+        0.45,
+        f"5. Seed (eroded ∩ allowed)\nr={GROW_SEED_EROSION_RADIUS}",
+    )
+    _overlay(
+        axes[1, 2],
+        yellow,
+        "orange",
+        0.45,
+        "6. Forbidden yellow (raster)",
+    )
+    _overlay(
+        axes[2, 0],
+        grown,
+        GROW_CURVE_COLOR,
+        0.40,
+        "7. Grown region (BFS)",
+    )
+    _overlay(
+        axes[2, 1],
+        new_px,
+        "cyan",
+        0.55,
+        "8. New pixels (grown \\ seed)\ntroughs recovered here",
+    )
 
-    axes[1, 1].imshow(rgb_c)
-    tint = np.zeros((*rgb_c.shape[:2], 4), dtype=float)
-    tint[crop(new_px)] = mcolors.to_rgba("cyan", alpha=0.55)
-    axes[1, 1].imshow(tint)
-    axes[1, 1].set_title("5. New pixels (grown \\ seed)\ntroughs recovered here", fontsize=9)
-    axes[1, 1].axis("off")
-
-    axes[1, 2].imshow(rgb_c)
+    axes[2, 2].imshow(rgb_c)
     if grow_top_curve_coords is not None and len(grow_top_curve_coords) > 0:
         arr = np.asarray(grow_top_curve_coords)
         if arr.ndim == 2 and arr.shape[1] >= 2:
@@ -1676,23 +1730,23 @@ def _plot_grow_main_steps_debug(
             m = (rows >= y0) & (rows < y1) & (cols >= x0) & (cols < x1)
             if np.any(m):
                 order = np.argsort(cols[m])
-                axes[1, 2].plot(
+                axes[2, 2].plot(
                     cols[m][order] - x0,
                     rows[m][order] - y0,
                     color=GROW_CURVE_COLOR,
                     linewidth=2.0,
                     label="grow envelope",
                 )
-                axes[1, 2].legend(loc="upper right", fontsize=8)
-    axes[1, 2].set_title("6. Grow envelope (morph thin on grown)", fontsize=9)
-    axes[1, 2].axis("off")
+                axes[2, 2].legend(loc="upper right", fontsize=8)
+    axes[2, 2].set_title("9. Grow envelope (morph thin on grown)", fontsize=9)
+    axes[2, 2].axis("off")
 
     fig.suptitle(
         f"Grow — Method 3 main steps (ROI y={y0}:{y1}, x={x0}:{x1})",
         fontsize=11,
         y=0.995,
     )
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
 
 
 def _morphological_top_curve_from_mask(
@@ -1824,6 +1878,8 @@ def segment_refinement(
         grow_forbid_yellow (bool, optional): If True (default), block region-grow
             expansion into HSV-detected instrument yellow (screenshots). Set False
             for DICOM, where yellow is rare and the mask can remove real signal.
+            Grow also intersects the ROI allowed mask with the same colour
+            k-means non-background gate used by ray tracing (speckle rejection).
 
     Returns:
         (tuple) : tuple containing:
@@ -1849,7 +1905,40 @@ def segment_refinement(
     # 1b) Constrained region grow from refined mask (seed) within ROI bounds
     h_img, w_img = input_image_obj.shape[:2]
     gray = cv2.cvtColor(input_image_obj, cv2.COLOR_BGR2GRAY)
-    allowed = allowed_mask_from_roi_bounds(h_img, w_img, Xmin, Xmax, Ymin, Ymax)
+    allowed_before_kmeans = allowed_mask_from_roi_bounds(
+        h_img, w_img, Xmin, Xmax, Ymin, Ymax
+    )
+    allowed = allowed_before_kmeans.copy()
+    kmeans_signal_full = None
+    # Same colour k-means prefilter as ray: block expansion into speckled background.
+    try:
+        ys, xs = np.where(allowed)
+        if ys.size > 0:
+            y0, y1 = int(ys.min()), int(ys.max()) + 1
+            x0, x1 = int(xs.min()), int(xs.max()) + 1
+            roi_bgr = input_image_obj[y0:y1, x0:x1]
+            roi_gray = gray[y0:y1, x0:x1]
+            signal_roi, bg_cluster, cluster_means, cluster_counts = (
+                colour_kmeans_signal_mask_roi(roi_bgr, roi_gray)
+            )
+            kmeans_signal_full = np.zeros_like(allowed, dtype=bool)
+            kmeans_signal_full[y0:y1, x0:x1] = signal_roi
+            n_before = int(np.sum(allowed))
+            allowed = allowed & kmeans_signal_full
+            logger.info(
+                "region grow: k-means signal gate mean_gray=%s counts=%s "
+                "bg=%s allowed %s -> %s",
+                [round(v, 2) if np.isfinite(v) else None for v in cluster_means],
+                cluster_counts,
+                bg_cluster,
+                n_before,
+                int(np.sum(allowed)),
+            )
+    except Exception:
+        logger.exception(
+            "segment_refinement: k-means signal gate for grow failed; "
+            "continuing with ROI allowed mask only"
+        )
     yellow_forbidden = None
     if grow_forbid_yellow:
         try:
@@ -1922,6 +2011,9 @@ def segment_refinement(
                 Ymin,
                 Ymax,
                 yellow_forbidden_mask=yellow_forbidden,
+                allowed_before_kmeans=allowed_before_kmeans,
+                kmeans_signal_mask=kmeans_signal_full,
+                allowed_after_kmeans=allowed,
             )
         except Exception:
             logger.exception("segment_refinement: grow main-steps debug plot failed")
@@ -2233,6 +2325,40 @@ def hsv_yellow_tick_mask_bgr(bgr: np.ndarray) -> np.ndarray:
     return yellow_mask.astype(bool)
 
 
+def colour_kmeans_signal_mask_roi(roi_bgr: np.ndarray, roi_gray: np.ndarray):
+    """
+    k-means (k=3) colour prefilter shared by ray tracing and region-grow.
+
+    Clusters ROI pixels in BGR; the cluster with the darkest mean gray is
+    background. Returns ``(signal_mask, bg_cluster, cluster_means, cluster_counts)``
+    where ``signal_mask`` is True for non-background clusters (same shape as ROI).
+    """
+    if roi_bgr.ndim != 3 or roi_bgr.shape[2] != 3:
+        raise ValueError("roi_bgr must be HxWx3 BGR")
+    if roi_gray.shape != roi_bgr.shape[:2]:
+        raise ValueError("roi_gray must match roi_bgr spatial shape")
+    if roi_gray.size == 0:
+        empty = np.zeros(roi_gray.shape, dtype=bool)
+        return empty, -1, [], []
+
+    px = roi_bgr.reshape((-1, 3)).astype(np.float32)
+    k = 3
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.2)
+    _compactness, labels, _centers = cv2.kmeans(
+        px, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS
+    )
+    labels = labels.reshape(roi_gray.shape)
+    cluster_means = []
+    cluster_counts = []
+    for ci in range(k):
+        m = labels == ci
+        cluster_means.append(float(np.mean(roi_gray[m])) if np.any(m) else np.inf)
+        cluster_counts.append(int(np.sum(m)))
+    bg_cluster = int(np.argmin(cluster_means))
+    signal_mask = labels != bg_cluster
+    return signal_mask, bg_cluster, cluster_means, cluster_counts
+
+
 def ray_trace_waveform_segmentation(
     input_image_obj,
     Xmin,
@@ -2275,25 +2401,13 @@ def ray_trace_waveform_segmentation(
     if roi_gray.size == 0:
         return np.zeros((h, w), dtype=float)
 
-    # Dynamic colour prefilter:
+    # Dynamic colour prefilter (shared with region-grow):
     # 1) Cluster all ROI pixels in colour space.
     # 2) Estimate which cluster is background by luminance (darkest mean gray).
     # 3) Keep everything else as "signal candidates".
-    px = roi_bgr.reshape((-1, 3)).astype(np.float32)
-    k = 3
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.2)
-    _compactness, labels, _centers = cv2.kmeans(
-        px, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS
+    signal_pre_yellow, bg_cluster, cluster_means, cluster_counts = (
+        colour_kmeans_signal_mask_roi(roi_bgr, roi_gray)
     )
-    labels = labels.reshape(roi_gray.shape)
-    cluster_means = []
-    cluster_counts = []
-    for ci in range(k):
-        m = labels == ci
-        cluster_means.append(float(np.mean(roi_gray[m])) if np.any(m) else np.inf)
-        cluster_counts.append(int(np.sum(m)))
-    bg_cluster = int(np.argmin(cluster_means))
-    signal_pre_yellow = labels != bg_cluster
     signal_mask = signal_pre_yellow.copy()
     logger.info(
         "ray_trace: clusters mean_gray=%s counts=%s -> background_cluster=%s",
