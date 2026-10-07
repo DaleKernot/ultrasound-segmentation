@@ -280,7 +280,7 @@ SHOW_BEAT_DEBUG_SUBPLOTS = False
 # Region-grow: main-steps figure (+ optional detailed pipeline); not saved to batch.
 SHOW_GROW_DEBUG_PLOTS = False
 # Morphological method: refined-mask stages + Method-1 envelope overlay.
-SHOW_MORPH_DEBUG_PLOTS = True
+SHOW_MORPH_DEBUG_PLOTS = False
 # Ray tracing: Method-2 main-steps figure only (k-means → yellow → picks → smooth).
 # Does not enable morph/grow/curve-comparison figures.
 SHOW_RAY_DEBUG_PLOTS = False
@@ -2502,6 +2502,7 @@ def ray_trace_waveform_segmentation(
     max_col_step_y,
     keep="upper",
     debug_plots=False,
+    allowed_mask=None,
 ):
     """Waveform boundary via column-wise ray tracing on colour-clustered signal.
 
@@ -2543,6 +2544,9 @@ def ray_trace_waveform_segmentation(
         colour_kmeans_signal_mask_roi(roi_bgr, roi_gray)
     )
     signal_mask = signal_pre_yellow.copy()
+    if allowed_mask is not None:
+        allowed_roi = np.asarray(allowed_mask, dtype=bool)[y1:y2, x1:x2]
+        signal_mask &= allowed_roi
     logger.info(
         "ray_trace: clusters mean_gray=%s counts=%s -> background_cluster=%s",
         [round(v, 2) if np.isfinite(v) else None for v in cluster_means],
@@ -2787,6 +2791,7 @@ def compute_top_curve(
                 max_col_step_y,
                 keep=keep,
                 debug_plots=False,
+                allowed_mask=refined_segmentation_mask,
             )
             if np.any(ray_mask > 0):
                 ray_thin = keep_one_pixel_per_column(

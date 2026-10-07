@@ -17,8 +17,7 @@ logger = logging.getLogger(__file__)
 
 def test_data_from_image():
     """Test the data_from_image function."""
-    #img_path = "F:\Ophthalmic\image_3.JPG" # Change this to the path of the image you want to test # BAD SCAN
-    img_path = "C:/Users/dalek/OneDrive/Documents/SADIE/ophthalmic/ophthalmic2/EYE039_17_12_2025_Rt.JPG"
+    img_path = "C:/Users/user/OneDrive/Desktop/STP/Master's/Year 3/data files/failed/EYE039_postnatal_5+1_right_ophthalmic.JPG"
 
 
     #PIL_image = Image.open(img_path)
@@ -34,7 +33,7 @@ def test_data_from_image():
     ax_trace.set_ylabel("Velocity")
     ax_trace.grid(True, alpha=0.3)
     fig.tight_layout()
-
+    
     # Makes sure that the lists aren't empty
     assert xdata
     assert ydata
